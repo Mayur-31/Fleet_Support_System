@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}Payment Run Generated — Fleet Support Payments{% endblock %}
+
+{% block content %}
+<h1 class="mb-4">Payment Run Generated — Week {{ week_number }}</h1>
+
+<div class="alert alert-success">
+    Payment run created (ID: {{ run_id }}). Total £{{ "%.2f"|format(total) }}.
+</div>
+
+<p>{{ row_count }} driver(s) included in the bank payment CSV.</p>
+
+{% if skipped %}
+<div class="alert alert-warning">
+    <strong>{{ skipped|length }} driver(s) skipped from the CSV</strong> — no bank details on file:
+    <ul class="mb-0">
+        {% for name in skipped %}
+        <li>{{ name }}</li>
+        {% endfor %}
+    </ul>
+    They were still included in the payment run itself and can be added to a
+    future CSV once their bank details are on file.
+</div>
+{% endif %}
+
+<div class="d-flex gap-2">
+    <a href="{{ url_for('download_csv', filename=csv_filename) }}" class="btn btn-primary btn-lg">
+        Download CSV
+    </a>
+    <a href="{{ url_for('home') }}" class="btn btn-outline-secondary btn-lg">Back to Home</a>
+</div>
+{% endblock %}

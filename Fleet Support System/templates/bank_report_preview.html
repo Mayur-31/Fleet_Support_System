@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Bank Report Preview{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <h2>Bank Report Preview</h2>
+    <p><strong>File:</strong> {{ result.filename }}</p>
+    <p><strong>Week:</strong> {{ result.week_number }}</p>
+    <div class="row">
+        <div class="col-md-2"><div class="card text-bg-success"><h5>Matched</h5><p>{{ result.matched_count }}</p></div></div>
+        <div class="col-md-2"><div class="card text-bg-danger"><h5>Unmatched</h5><p>{{ result.unmatched_count }}</p></div></div>
+        <div class="col-md-2"><div class="card text-bg-warning"><h5>Amount Mismatch</h5><p>{{ result.amount_mismatch_count }}</p></div></div>
+        <div class="col-md-2"><div class="card text-bg-secondary"><h5>Not Applicable</h5><p>{{ result.not_applicable_count }}</p></div></div>
+        <div class="col-md-2"><div class="card text-bg-info"><h5>Ambiguous</h5><p>{{ result.ambiguous_count }}</p></div></div>
+    </div>
+    <p class="text-muted mt-3">Preview is advisory. Matching and duplicate checks are revalidated during commit.</p>
+
+    {% if result.preview_lines %}
+    <h4>Detailed Preview (first 20 lines)</h4>
+    <div class="table-responsive">
+        <table class="table table-sm table-striped">
+            <thead>
+                <tr>
+                    <th>Bank Line ID</th>
+                    <th>Driver Ref</th>
+                    <th>Amount</th>
+                    <th>Status</th>
+                    <th>Reason</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for line in result.preview_lines[:20] %}
+                <tr>
+                    <td>{{ line.bank_line_id }}</td>
+                    <td>{{ line.driver_reference or '-' }}</td>
+                    <td>£{{ line.beneficiary_amount }}</td>
+                    <td>
+                        <span class="badge bg-{{ 
+                            'success' if line.status == 'matched' 
+                            else 'danger' if line.status == 'unmatched' 
+                            else 'warning' if line.status in ('ambiguous', 'amount_mismatch')
+                            else 'secondary' 
+                        }}">
+                            {{ line.status }}
+                        </span>
+                    </td>
+                    <td>{{ line.reason }}</td>
+                </tr>
+                {% endfor %}
+                {% if result.preview_lines|length > 20 %}
+                <tr><td colspan="5" class="text-muted">... and {{ result.preview_lines|length - 20 }} more</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    <form action="{{ url_for('bank_report_confirm') }}" method="post">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="token" value="{{ token }}">
+        <button type="submit" class="btn btn-success" onclick="return confirm('Commit this reconciliation?')">Commit Report</button>
+        <a href="{{ url_for('bank_report_list') }}" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{% endblock %}

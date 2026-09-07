@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Fleet Support Payments — Home{% endblock %}
+
+{% block content %}
+<div class="text-center">
+    <h1 class="mb-3">Fleet Support Payments</h1>
+    <p class="text-muted mb-5">Import weekly expenses and generate driver payment files.</p>
+
+    <div class="d-grid gap-3 col-8 col-md-4 mx-auto">
+        <a href="{{ url_for('upload') }}" class="btn btn-primary btn-lg">
+            Upload Expenses File
+        </a>
+        <a href="{{ url_for('payment_runs') }}" class="btn btn-outline-secondary btn-lg">
+            View Previous Payment Runs
+        </a>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Upload Bank Report{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <h2>Upload Bank Report</h2>
+    <form action="{{ url_for('bank_report_upload') }}" method="post" enctype="multipart/form-data">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="mb-3">
+            <label for="file" class="form-label">Bank Excel File (.xlsx)</label>
+            <input type="file" name="file" id="file" class="form-control" accept=".xlsx" required>
+        </div>
+        <button type="submit" class="btn btn-primary">Upload &amp; Preview</button>
+        <a href="{{ url_for('bank_report_list') }}" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{% endblock %}
