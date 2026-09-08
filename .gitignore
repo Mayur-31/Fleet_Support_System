@@ -1,0 +1,42 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Test / uploaded data
+data/*
+!data/.gitkeep
+
+uploads/*
+!uploads/.gitkeep
+
+# Generated files
+output/*
+!output/.gitkeep
+
+previews/*
+!previews/.gitkeep
+
+# Backups
+backups/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Kamal secrets
+.kamal/secrets
+.kamal/secrets.*

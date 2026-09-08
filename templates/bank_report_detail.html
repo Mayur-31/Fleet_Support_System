@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Bank Report Details{% endblock %}
+{% block content %}
+<div class="container mt-4">
+    <h2>Bank Report Details</h2>
+    <dl class="row">
+        <dt class="col-sm-3">File</dt><dd class="col-sm-9">{{ report.filename }}</dd>
+        <dt class="col-sm-3">Week</dt><dd class="col-sm-9">{{ report.week_number }}</dd>
+        <dt class="col-sm-3">Uploaded</dt><dd class="col-sm-9">{{ report.uploaded_at|datetime }}</dd>
+        <dt class="col-sm-3">Processed</dt>
+        <dd class="col-sm-9">
+            {% if report.processed_at %}
+                {{ report.processed_at|datetime }}
+            {% else %}
+                Not yet
+            {% endif %}
+        </dd>
+    </dl>
+    <h3>Summary</h3>
+    <ul>
+        <li>Matched: {{ report.matched_count }}</li>
+        <li>Unmatched: {{ report.unmatched_count }}</li>
+        <li>Amount Mismatch: {{ report.amount_mismatch_count }}</li>
+        <li>Ambiguous: {{ report.ambiguous_count }}</li>
+        <li>Not Applicable: {{ report.not_applicable_count }}</li>
+    </ul>
+    <h3>Lines</h3>
+    <table class="table table-striped">
+        <thead>
+            <tr>
+                <th>Bank Line ID</th>
+                <th>Driver Ref</th>
+                <th>Beneficiary</th>
+                <th>Amount</th>
+                <th>Match Status</th>
+                <th>Reason</th>
+                <th>Expense ID</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for line in lines %}
+            <tr>
+                <td>{{ line.bank_line_id }}</td>
+                <td>{{ line.driver_reference or '-' }}</td>
+                <td>{{ line.beneficiary_name }}</td>
+                <td>£{{ line.beneficiary_amount }}</td>
+                <td>
+                    <span class="badge bg-{{ 
+                        'success' if line.match_status == 'matched' 
+                        else 'danger' if line.match_status == 'unmatched' 
+                        else 'warning' if line.match_status in ('ambiguous', 'amount_mismatch')
+                        else 'secondary' 
+                    }}">
+                        {{ line.match_status }}
+                    </span>
+                </td>
+                <td>{{ line.reason }}</td>
+                <td>{{ line.matched_job_expense_id or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    <h3>Danger Zone</h3>
+    <form action="{{ url_for('delete_bank_report', report_id=report.id) }}" method="post" style="display:inline;"
+            onsubmit="return confirm('Delete this bank report? This will also remove all its lines.')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label class="small">
+            <input type="checkbox" name="revert_expenses" value="on" checked>
+            Revert expenses to unpaid
+        </label>
+        <button type="submit" class="btn btn-danger">Delete Report</button>
+    </form>
+    <a href="{{ url_for('bank_report_list') }}" class="btn btn-secondary">Back to Reports</a>
+</div>
+{% endblock %}

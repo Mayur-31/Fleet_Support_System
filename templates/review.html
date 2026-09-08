@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Review — Fleet Support Payments{% endblock %}
+
+{% block content %}
+<h1 class="mb-4">Review — Week {{ week_number }}</h1>
+
+{% if unmatched %}
+<div class="alert alert-warning">
+    <strong>{{ unmatched|length }} driver code(s) not found</strong> in the drivers table
+    and excluded from this run:
+    <ul class="mb-0">
+        {% for code in unmatched %}
+        <li>{{ code }}</li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+<table class="table table-bordered">
+    <thead class="table-dark">
+        <tr>
+            <th>Driver Code</th>
+            <th>Name</th>
+            <th class="text-end">Amount (£)</th>
+            <th>Bank Details Available</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for row in matched %}
+        <tr class="{{ 'table-danger' if not row.bank_available }}">
+            <td>{{ row.driver_code }}</td>
+            <td>{{ row.name }}</td>
+            <td class="text-end">{{ "%.2f"|format(row.amount) }}</td>
+            <td>
+                {% if row.bank_available %}
+                    <span class="badge bg-success">Yes</span>
+                {% else %}
+                    <span class="badge bg-danger">No</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+    <tfoot>
+        <tr class="table-secondary">
+            <th colspan="2">Total</th>
+            <th class="text-end">£{{ "%.2f"|format(total) }}</th>
+            <th></th>
+        </tr>
+    </tfoot>
+</table>
+
+{% if missing_count > 0 %}
+<div class="alert alert-warning">
+    <strong>{{ missing_count }} driver(s) are missing bank details.</strong>
+    They will still be included in this payment run, but will be excluded
+    from the bank payment file when it's generated (a later task) until
+    their bank details are added.
+</div>
+{% endif %}
+
+<form method="post" action="{{ url_for('generate_payment_run') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="saved_path" value="{{ saved_path }}">
+    <input type="hidden" name="week_number" value="{{ week_number }}">
+    <button type="submit" class="btn btn-primary btn-lg">Generate Payment Run</button>
+</form>
+
+{% endblock %}

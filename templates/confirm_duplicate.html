@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}Duplicate Payment Run? — Fleet Support Payments{% endblock %}
+
+{% block content %}
+<h1 class="mb-4">Week {{ week_number }} Already Has a Payment Run</h1>
+
+<div class="alert alert-warning">
+    <strong>{{ existing_runs|length }} existing payment run(s) found for week {{ week_number }}:</strong>
+    <ul class="mb-0">
+        {% for run in existing_runs %}
+        <li>ID: {{ run.id }} — status: {{ run.status }} — created: {{ run.created_at }}</li>
+        {% endfor %}
+    </ul>
+</div>
+
+<p>
+    Creating another one will insert a second, separate set of driver payments
+    for this week. Only continue if you're intentionally correcting or
+    re-running the import — otherwise go back and check the existing run
+    first, to avoid paying drivers twice.
+</p>
+
+<form method="post" action="{{ url_for('generate_payment_run') }}" class="d-inline">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="saved_path" value="{{ saved_path }}">
+    <input type="hidden" name="week_number" value="{{ week_number }}">
+    <input type="hidden" name="confirm" value="yes">
+    <button type="submit" class="btn btn-danger">Create Another Run Anyway</button>
+</form>
+<a href="javascript:history.back()" class="btn btn-outline-secondary">Go Back</a>
+
+{% endblock %}

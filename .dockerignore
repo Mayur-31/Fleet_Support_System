@@ -1,0 +1,13 @@
+.env
+.git
+.gitignore
+.kamal
+data/
+uploads/*
+output/*
+previews/*
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.log

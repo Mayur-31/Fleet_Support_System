@@ -1,0 +1,48 @@
+service: fleet-support-system
+image: ms3347/fleet-support-system
+
+servers:
+  web:
+    - 157.180.87.7
+
+registry:
+  username: ms3347
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+builder:
+  arch: arm64
+
+proxy:
+  hosts:
+    - portal.fleetmovement.com      # primary domain
+  ssl: true                         # automatic Let's Encrypt
+  app_port: 3000
+  healthcheck:
+    path: /up
+    interval: 5
+    timeout: 5
+
+volumes:
+  - "/var/lib/fleet-support/uploads:/app/uploads"
+  - "/var/lib/fleet-support/output:/app/output"
+
+env:
+  clear:
+    FLASK_ENV: production
+    PYTHONUNBUFFERED: "1"
+  secret:
+    - FLASK_SECRET_KEY
+    - SUPABASE_URL
+    - SUPABASE_SECRET_KEY
+    - SMTP_HOST
+    - SMTP_PORT
+    - SMTP_USERNAME
+    - SMTP_PASSWORD
+    - FROM_EMAIL
+
+ssh:
+  user: root
+  port: 22
+  keys:
+    - "~/.ssh/fleet_support_production"
