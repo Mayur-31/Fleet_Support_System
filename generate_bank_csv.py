@@ -4,15 +4,8 @@ Generates the Faster Payments bank-upload CSV for a given payment run.
 Usage:
     python generate_bank_csv.py --run-id <payment_run_id>
 
-Output format matches the sample Charlotte shared:
-    sort_code, account_number, driver_name, amount, reference, 99
-
-Known open question (confirm with Charlotte/the bank before relying on
-this for a real payment): the exact reference number scheme. The sample
-looked like an incrementing invoice number plus week/year
-(e.g. "1420891-29-2026"). This script generates a placeholder reference
-of "WK{week}-{driver_code}" until the real numbering rule is confirmed —
-do not treat the reference column as production-ready yet.
+Output format (verified with Week 33 sample):
+    sort_code, account_name, account_number, amount, reference, 99
 """
 import argparse
 import csv
@@ -27,84 +20,157 @@ log = logging.getLogger(__name__)
 
 
 def fetch_payment_run(run_id: str) -> dict:
+    """Fetch the payment run record."""
     result = supabase.table("payment_runs").select("*").eq("id", run_id).execute()
     if not result.data:
         raise ValueError(f"No payment_run found with id {run_id}")
     return result.data[0]
 
 
-def fetch_rows(run_id: str) -> list:
+def fetch_expenses(run_id: str) -> list:
+    """
+    Fetch all expenses for a payment run, ordered by ID for deterministic output.
+    Returns list of {id, driver_id, amount}.
+    """
     result = (
         supabase.table("job_expenses")
-        .select(
-            """
-            amount,
-            drivers (
-                name,
-                driver_code,
-                driver_bank_details (
-                    account_number,
-                    sort_code
-                )
-            )
-            """
-        )
+        .select("id, driver_id, amount")
         .eq("payment_run_id", run_id)
+        .order("id")          # deterministic ordering
         .execute()
     )
-    return result.data
+    return result.data or []
 
 
-def build_csv_rows(rows: list, week_number: int):
-    """Returns (csv_rows, skipped_driver_names)."""
+def fetch_drivers_batch(driver_ids: list) -> dict:
+    """
+    Fetch driver names and codes for a list of driver_ids.
+    Returns dict mapping driver_id -> {name, driver_code}.
+    """
+    if not driver_ids:
+        return {}
+
+    result = (
+        supabase.table("drivers")
+        .select("id, name, driver_code")
+        .in_("id", driver_ids)
+        .execute()
+    )
+    return {row["id"]: row for row in (result.data or [])}
+
+
+def fetch_bank_details_batch(driver_ids: list) -> dict:
+    """
+    Fetch bank details for a list of driver_ids.
+    Returns dict mapping driver_id -> {sort_code, account_number, account_name}.
+    Raises ValueError if any driver has duplicate bank records.
+    """
+    if not driver_ids:
+        return {}
+
+    result = (
+        supabase.table("driver_bank_details")
+        .select("driver_id, sort_code, account_number, account_name")
+        .in_("driver_id", driver_ids)
+        .execute()
+    )
+
+    # Check for duplicate bank records per driver
+    bank_map = {}
+    duplicates = []
+    for row in (result.data or []):
+        d_id = row["driver_id"]
+        if d_id in bank_map:
+            duplicates.append(d_id)
+        else:
+            bank_map[d_id] = row
+
+    if duplicates:
+        raise ValueError(
+            f"Duplicate bank records found for driver(s): {', '.join(duplicates)}. "
+            "Please ensure each driver has exactly one bank record."
+        )
+
+    return bank_map
+
+
+def generate_csv(run_id: str, output_dir: str = "output") -> dict:
+    """
+    Generate the Faster Payments CSV for a payment run.
+    Returns a dict with filename, path, row_count, skipped, and week_number.
+    Raises ValueError if any expense lacks a driver or valid bank details.
+    """
+    run = fetch_payment_run(run_id)
+    week_number = run["week_number"]
+
+    expenses = fetch_expenses(run_id)
+    if not expenses:
+        raise ValueError("No job_expenses rows found for this payment run.")
+
+    # Collect unique driver IDs
+    driver_ids = list({exp["driver_id"] for exp in expenses if exp.get("driver_id")})
+
+    # Batch fetch drivers and bank details
+    drivers = fetch_drivers_batch(driver_ids)
+    try:
+        bank_details = fetch_bank_details_batch(driver_ids)
+    except ValueError as e:
+        # Re-raise with context for the CSV generation failure
+        raise ValueError(f"Bank details issue: {e}")
+
     csv_rows = []
-    skipped = []
+    missing = []
 
-    for r in rows:
-        driver = r["drivers"]
-        bank = driver.get("driver_bank_details")
+    for exp in expenses:
+        driver_id = exp.get("driver_id")
+        if not driver_id:
+            missing.append(f"Expense {exp['id']} has no driver_id")
+            continue
 
+        driver = drivers.get(driver_id)
+        if not driver:
+            missing.append(f"Expense {exp['id']} references missing driver {driver_id}")
+            continue
+
+        bank = bank_details.get(driver_id)
         if not bank:
-            skipped.append(driver["name"])
+            missing.append(f"Driver {driver['name']} ({driver_id}) has no bank details")
+            continue
+
+        # Validate required bank fields are not empty
+        if not bank.get("sort_code") or not bank.get("account_number") or not bank.get("account_name"):
+            missing.append(
+                f"Driver {driver['name']} ({driver_id}) has incomplete bank details "
+                "(missing sort_code, account_number, or account_name)"
+            )
             continue
 
         reference = f"WK{week_number}-{driver['driver_code']}"
         csv_rows.append(
             [
                 bank["sort_code"],
-                driver["name"],
+                bank["account_name"],
                 bank["account_number"],
-                f"{r['amount']:.2f}",
+                f"{exp['amount']:.2f}",
                 reference,
                 99,
             ]
         )
 
-    return csv_rows, skipped
+    if missing:
+        raise ValueError(
+            f"Cannot generate CSV: {len(missing)} issue(s) found:\n" + "\n".join(missing)
+        )
 
-def generate_csv(run_id: str, output_dir: str = "output"):
-    """
-    Generate the Faster Payments CSV for a payment run.
-    Returns a dict with filename, path, row_count, skipped, and week_number.
-    Raises ValueError on failure.
-    """
-    run = fetch_payment_run(run_id)
-    week_number = run["week_number"]
-
-    rows = fetch_rows(run_id)
-    if not rows:
-        raise ValueError("No job_expenses rows found for this payment run.")
-
-    csv_rows, skipped = build_csv_rows(rows, week_number)
     if not csv_rows:
-        raise ValueError("No drivers had bank details — nothing to export.")
+        raise ValueError("No valid CSV rows could be generated – check expense data.")
 
+    # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
     csv_filename = f"FasterPayments_Week{week_number}_{run_id[:8]}.csv"
     output_path = os.path.join(output_dir, csv_filename)
 
-    # UTF-8 encoding ensures safe handling of names with special characters
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerows(csv_rows)
@@ -113,20 +179,21 @@ def generate_csv(run_id: str, output_dir: str = "output"):
         "filename": csv_filename,
         "path": output_path,
         "row_count": len(csv_rows),
-        "skipped": skipped,
+        "skipped": missing,   # empty if success
         "week_number": week_number,
     }
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Generate the Faster Payments CSV for a payment run.")
+    parser = argparse.ArgumentParser(
+        description="Generate the Faster Payments CSV for a payment run."
+    )
     parser.add_argument("--run-id", required=True, help="payment_runs.id to export")
     args = parser.parse_args()
 
     try:
         result = generate_csv(args.run_id)
-        print(f"\nWrote {result['row_count']} row(s) to {result['path']}")
-        if result['skipped']:
-            print(f"Skipped {len(result['skipped'])} driver(s) with no bank details: {', '.join(result['skipped'])}")
+        print(f"\n✅ Wrote {result['row_count']} row(s) to {result['path']}")
     except ValueError as e:
         log.error(e)
         sys.exit(1)
