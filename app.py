@@ -723,17 +723,65 @@ def admin_delete_user(user_id):
 def delete_payment_run(run_id):
     run_id_str = str(run_id)
 
-    run_resp = supabase.table('payment_runs').select('id, week_number').eq('id', run_id_str).execute()
-    if not run_resp.data:
-        flash('Payment run not found.', 'danger')
-        return redirect(url_for('payment_runs'))
+    try:
+        # 1. Verify the payment run exists
+        run_resp = supabase.table('payment_runs') \
+            .select('id, week_number') \
+            .eq('id', run_id_str) \
+            .execute()
+        if not run_resp.data:
+            flash('Payment run not found.', 'danger')
+            return redirect(url_for('payment_runs'))
 
-    supabase.table('job_expenses').delete().eq('payment_run_id', run_id_str).execute()
-    supabase.table('payment_runs').delete().eq('id', run_id_str).execute()
+        week_number = run_resp.data[0]['week_number']
 
-    flash(f'Payment run for Week {run_resp.data[0]["week_number"]} deleted successfully.', 'success')
+        # 2. Get all expense IDs for this run
+        exp_resp = supabase.table('job_expenses') \
+            .select('id') \
+            .eq('payment_run_id', run_id_str) \
+            .execute()
+        expense_ids = [row['id'] for row in (exp_resp.data or [])]
+
+        # 3. Check if any expense is referenced by a bank_report_line
+        if expense_ids:
+            dep_resp = supabase.table('bank_report_lines') \
+                .select('matched_job_expense_id') \
+                .in_('matched_job_expense_id', expense_ids) \
+                .execute()
+            if dep_resp.data:
+                flash(
+                    f'Cannot delete payment run for Week {week_number} because '
+                    'some expenses have already been reconciled against a bank report. '
+                    'Please delete the associated bank report(s) first.',
+                    'danger'
+                )
+                return redirect(url_for('payment_runs'))
+
+        # 4. Delete job_expenses (now safe)
+        supabase.table('job_expenses') \
+            .delete() \
+            .eq('payment_run_id', run_id_str) \
+            .execute()
+
+        # 5. Delete the payment run
+        supabase.table('payment_runs') \
+            .delete() \
+            .eq('id', run_id_str) \
+            .execute()
+
+        flash(f'Payment run for Week {week_number} deleted successfully.', 'success')
+
+    except Exception as e:
+        # Log the error server‑side
+        app.logger.exception(f'Error deleting payment run {run_id_str}: {e}')
+        flash(
+            'The payment run could not be deleted because it is still '
+            'being used by another record. Please check its reconciliation '
+            'or contact an administrator.',
+            'danger'
+        )
+
     return redirect(url_for('payment_runs'))
-
 
 # ========== DELETE BANK REPORT ==========
 @app.route('/bank-reports/<uuid:report_id>/delete', methods=['POST'])
