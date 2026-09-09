@@ -5,7 +5,7 @@ Usage:
     python generate_bank_csv.py --run-id <payment_run_id>
 
 Output format (verified with Week 33 sample):
-    sort_code, account_name, account_number, amount, reference, 99
+    sort_code, driver_name, account_number, amount, reference, 99
 """
 import argparse
 import csv
@@ -62,7 +62,7 @@ def fetch_drivers_batch(driver_ids: list) -> dict:
 def fetch_bank_details_batch(driver_ids: list) -> dict:
     """
     Fetch bank details for a list of driver_ids.
-    Returns dict mapping driver_id -> {sort_code, account_number, account_name}.
+    Returns dict mapping driver_id -> {sort_code, account_number}.
     Raises ValueError if any driver has duplicate bank records.
     """
     if not driver_ids:
@@ -70,7 +70,7 @@ def fetch_bank_details_batch(driver_ids: list) -> dict:
 
     result = (
         supabase.table("driver_bank_details")
-        .select("driver_id, sort_code, account_number, account_name")
+        .select("driver_id, sort_code, account_number")   # account_name removed
         .in_("driver_id", driver_ids)
         .execute()
     )
@@ -115,7 +115,6 @@ def generate_csv(run_id: str, output_dir: str = "output") -> dict:
     try:
         bank_details = fetch_bank_details_batch(driver_ids)
     except ValueError as e:
-        # Re-raise with context for the CSV generation failure
         raise ValueError(f"Bank details issue: {e}")
 
     csv_rows = []
@@ -137,11 +136,11 @@ def generate_csv(run_id: str, output_dir: str = "output") -> dict:
             missing.append(f"Driver {driver['name']} ({driver_id}) has no bank details")
             continue
 
-        # Validate required bank fields are not empty
-        if not bank.get("sort_code") or not bank.get("account_number") or not bank.get("account_name"):
+        # Validate required bank fields are present (sort_code and account_number)
+        if not bank.get("sort_code") or not bank.get("account_number"):
             missing.append(
                 f"Driver {driver['name']} ({driver_id}) has incomplete bank details "
-                "(missing sort_code, account_number, or account_name)"
+                "(missing sort_code or account_number)"
             )
             continue
 
@@ -149,7 +148,7 @@ def generate_csv(run_id: str, output_dir: str = "output") -> dict:
         csv_rows.append(
             [
                 bank["sort_code"],
-                bank["account_name"],
+                driver["name"],                     # <-- Use driver name instead of account_name
                 bank["account_number"],
                 f"{exp['amount']:.2f}",
                 reference,
