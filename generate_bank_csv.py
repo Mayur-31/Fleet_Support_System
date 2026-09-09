@@ -17,6 +17,8 @@ do not treat the reference column as production-ready yet.
 import argparse
 import csv
 import logging
+import os
+import sys
 
 from database import supabase
 
@@ -80,41 +82,54 @@ def build_csv_rows(rows: list, week_number: int):
 
     return csv_rows, skipped
 
+def generate_csv(run_id: str, output_dir: str = "output"):
+    """
+    Generate the Faster Payments CSV for a payment run.
+    Returns a dict with filename, path, row_count, skipped, and week_number.
+    Raises ValueError on failure.
+    """
+    run = fetch_payment_run(run_id)
+    week_number = run["week_number"]
+
+    rows = fetch_rows(run_id)
+    if not rows:
+        raise ValueError("No job_expenses rows found for this payment run.")
+
+    csv_rows, skipped = build_csv_rows(rows, week_number)
+    if not csv_rows:
+        raise ValueError("No drivers had bank details — nothing to export.")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    csv_filename = f"FasterPayments_Week{week_number}_{run_id[:8]}.csv"
+    output_path = os.path.join(output_dir, csv_filename)
+
+    # UTF-8 encoding ensures safe handling of names with special characters
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(csv_rows)
+
+    return {
+        "filename": csv_filename,
+        "path": output_path,
+        "row_count": len(csv_rows),
+        "skipped": skipped,
+        "week_number": week_number,
+    }
 
 def main():
     parser = argparse.ArgumentParser(description="Generate the Faster Payments CSV for a payment run.")
     parser.add_argument("--run-id", required=True, help="payment_runs.id to export")
     args = parser.parse_args()
 
-    run = fetch_payment_run(args.run_id)
-    week_number = run["week_number"]
-
-    rows = fetch_rows(args.run_id)
-    if not rows:
-        log.error("No job_expenses rows found for this payment run.")
-        return
-
-    csv_rows, skipped = build_csv_rows(rows, week_number)
-
-    if skipped:
-        log.warning(
-            "%d driver(s) have no bank details on file and were skipped: %s",
-            len(skipped),
-            ", ".join(skipped),
-        )
-
-    if not csv_rows:
-        log.error("No drivers had bank details — nothing to export.")
-        return
-
-    output_path = f"output/FasterPayments_Week{week_number}.csv"
-    with open(output_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerows(csv_rows)
-
-    print(f"\nWrote {len(csv_rows)} row(s) to {output_path}")
-    if skipped:
-        print(f"Skipped {len(skipped)} driver(s) with no bank details — see warning above.")
+    try:
+        result = generate_csv(args.run_id)
+        print(f"\nWrote {result['row_count']} row(s) to {result['path']}")
+        if result['skipped']:
+            print(f"Skipped {len(result['skipped'])} driver(s) with no bank details: {', '.join(result['skipped'])}")
+    except ValueError as e:
+        log.error(e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

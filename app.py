@@ -460,42 +460,36 @@ def generate_payment_run():
         flash("Something went wrong creating the payment run. Nothing was saved.", "danger")
         return redirect(url_for("upload"))
 
+    # ----- Generate CSV using the unified generator -----
     try:
-        run = generate_bank_csv.fetch_payment_run(run_id)
-        rows = generate_bank_csv.fetch_rows(run_id)
-        csv_rows, skipped = generate_bank_csv.build_csv_rows(rows, run["week_number"])
-    except Exception:
+        result = generate_bank_csv.generate_csv(run_id)
+    except ValueError as e:
+        app.logger.exception(f"CSV generation failed for run {run_id}: {e}")
         flash(
-            f"Payment run created (ID: {run_id}) but the bank CSV could not be generated. "
-            f"You can still generate it with generate_bank_csv.py --run-id {run_id}.",
+            f"Payment run created (ID: {run_id}) but the CSV could not be generated. "
+            "The error has been logged. Please contact support if the problem persists.",
+            "danger",
+        )
+        return redirect(url_for("home"))
+    except Exception as e:
+        app.logger.exception(f"Unexpected error during CSV generation for run {run_id}: {e}")
+        flash(
+            f"Payment run created (ID: {run_id}) but an unexpected error occurred. "
+            "The error has been logged. Please contact support.",
             "danger",
         )
         return redirect(url_for("home"))
 
-    if not csv_rows:
-        flash(
-            f"Payment run created (ID: {run_id}) but no drivers had bank details on file — "
-            f"no CSV was generated.",
-            "warning",
-        )
-        return redirect(url_for("home"))
-
-    # NOTE: reference format (WK{week}-{driver_code}) is a placeholder,
-    # kept exactly as-is per instruction — unrelated to this change.
-    csv_filename = f"FasterPayments_Week{run['week_number']}_{run_id[:8]}.csv"
-    output_path = os.path.join("output", csv_filename)
-    with open(output_path, "w", newline="") as f:
-        csv_module.writer(f).writerows(csv_rows)
-
+    # Mark the run as generated only after CSV is successfully written
     supabase.table("payment_runs").update({"status": "generated"}).eq("id", run_id).execute()
 
     return render_template(
         "generate_result.html",
         run_id=run_id,
-        week_number=run["week_number"],
-        row_count=len(csv_rows),
-        skipped=skipped,
-        csv_filename=csv_filename,
+        week_number=result["week_number"],
+        row_count=result["row_count"],
+        skipped=result["skipped"],
+        csv_filename=result["filename"],
         total=sum(r["amount"] for r in matched),
     )
 
