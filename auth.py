@@ -167,6 +167,37 @@ def admin_required(view_func):
 
     return wrapped
 
+def active_user_required(view_func):
+    """
+    Allows any logged-in, active user (regardless of role) to access
+    the route. Management has approved shared access to payment-run
+    and bank-report features for all active users.
+
+    Still re-checks `active` from the database on every request — a
+    deactivated account shouldn't keep working via a stale session
+    cookie.
+    """
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        user_id = session.get("user_id")
+        if not user_id:
+            flash("Please log in to continue.", "warning")
+            return redirect(url_for("login", next=request.path))
+
+        result = supabase.table("users").select("active").eq("id", user_id).execute()
+        current = result.data[0] if result.data else None
+
+        if not current or not current["active"]:
+            session.clear()
+            flash(
+                "Your account is no longer active. Please contact an administrator.",
+                "danger",
+            )
+            return redirect(url_for("login"))
+
+        return view_func(*args, **kwargs)
+
+    return wrapped
 
 def list_users():
     return (

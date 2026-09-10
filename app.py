@@ -524,7 +524,7 @@ def payment_runs():
 
 @app.route('/bank-reports')
 @auth.login_required
-@auth.admin_required
+@auth.active_user_required
 def bank_report_list():
     try:
         resp = supabase.table('bank_reports').select('*').order('uploaded_at', desc=True).execute()
@@ -537,7 +537,7 @@ def bank_report_list():
 
 @app.route('/bank-reports/upload', methods=['GET', 'POST'])
 @auth.login_required
-@auth.admin_required
+@auth.active_user_required
 def bank_report_upload():
     cleanup_old_previews()
 
@@ -586,7 +586,7 @@ def bank_report_upload():
 
 @app.route('/bank-reports/confirm', methods=['POST'])
 @auth.login_required
-@auth.admin_required
+@auth.active_user_required
 def bank_report_confirm():
     token = request.form.get('token')
     if not token:
@@ -672,7 +672,7 @@ def bank_report_confirm():
 
 @app.route('/bank-reports/<uuid:report_id>')
 @auth.login_required
-@auth.admin_required
+@auth.active_user_required
 def bank_report_detail(report_id):
     try:
         report_resp = supabase.table('bank_reports').select('*').eq('id', str(report_id)).execute()
@@ -713,7 +713,7 @@ def admin_delete_user(user_id):
 # ========== DELETE PAYMENT RUN ==========
 @app.route('/payment-runs/<uuid:run_id>/delete', methods=['POST'])
 @auth.login_required
-@auth.admin_required
+@auth.active_user_required
 def delete_payment_run(run_id):
     run_id_str = str(run_id)
 
@@ -780,7 +780,7 @@ def delete_payment_run(run_id):
 # ========== DELETE BANK REPORT ==========
 @app.route('/bank-reports/<uuid:report_id>/delete', methods=['POST'])
 @auth.login_required
-@auth.admin_required
+@auth.active_user_required
 def delete_bank_report(report_id):
     """
     Delete a bank report and its lines.

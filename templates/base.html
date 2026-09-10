@@ -20,11 +20,10 @@
             Logged in as {{ session.get('user_name') }}
         </span>
         {% if session.get('role') == 'admin' %}
-        
         <a href="{{ url_for('admin_users') }}" class="btn btn-outline-light btn-sm me-2">Manage Users</a>
+        {% endif %}
 
         <a href="{{ url_for('bank_report_list') }}" class="btn btn-outline-light btn-sm me-2">Bank Reports</a>
-        {% endif %}
         
         <form method="post" action="{{ url_for('logout') }}" class="d-inline">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
