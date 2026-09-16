@@ -174,6 +174,17 @@ def format_datetime(value):
         return value.strftime('%Y-%m-%d %H:%M')
     return value
 
+@app.template_filter('date_only')
+def format_date_only(value):
+    """Reformat an ISO 'YYYY-MM-DD' string as 'DD/MM/YYYY'."""
+    if not value:
+        return "—"
+    if hasattr(value, "strftime"):
+        return value.strftime("%d/%m/%Y")
+    if isinstance(value, str) and len(value) >= 10:
+        return f"{value[8:10]}/{value[5:7]}/{value[0:4]}"
+    return value
+
 @app.get("/up")
 def health_check():
     """Kamal-proxy hits this before routing traffic to a new container.
@@ -329,6 +340,14 @@ def upload():
 
     safe_name = secure_filename(file.filename)
     saved_name = f"{uuid.uuid4().hex}_{safe_name}"
+    expense_file_date = import_expenses.parse_expense_date(safe_name)
+    if not expense_file_date:
+        flash(
+            "Couldn't find a date in the filename (expected something like "
+            "'EXPENSES 15.09.2026.xlsx') — the payment run will still be created, "
+            "but won't show an expense date in the history.",
+            "warning",
+        )
     saved_path = os.path.join(UPLOAD_FOLDER, saved_name)
     file.save(saved_path)
 
@@ -349,6 +368,7 @@ def upload():
         "total": sum(row["amount"] for row in matched),
         "source_file": safe_name,
         "saved_path": saved_path,
+        "expense_file_date": expense_file_date or "",
     }
 
     return render_template("upload.html", results=results)
@@ -453,9 +473,9 @@ def generate_payment_run():
                 week_number=week_number,
                 saved_path=saved_path,
             )
-
+    expense_file_date = import_expenses.parse_expense_date(os.path.basename(saved_path))
     try:
-        run_id = import_expenses.commit_to_database(int(week_number), matched)
+        run_id = import_expenses.commit_to_database(int(week_number), matched, expense_file_date)
     except Exception:
         flash("Something went wrong creating the payment run. Nothing was saved.", "danger")
         return redirect(url_for("upload"))

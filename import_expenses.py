@@ -2,7 +2,9 @@ import argparse
 import logging
 import os
 import sys
- 
+import re
+from datetime import date as date_type
+from typing import Optional
 import pandas as pd
  
 from database import supabase
@@ -12,7 +14,25 @@ log = logging.getLogger(__name__)
  
 REQUIRED_COLUMNS = {"code", "AV"}
  
- 
+_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})[._\s-](\d{1,2})[._\s-](\d{4})(?!\d)")
+
+
+def parse_expense_date(filename: str) -> Optional[str]:
+    """
+    Extract the expense date from a filename like 'EXPENSES 15.09.2026.xlsx'.
+    Returns an ISO string ('YYYY-MM-DD') or None.
+    """
+    if not filename:
+        return None
+    match = _DATE_RE.search(filename)
+    if not match:
+        return None
+    day, month, year = (int(g) for g in match.groups())
+    try:
+        return date_type(year, month, day).isoformat()
+    except ValueError:
+        return None
+
 def load_and_aggregate(filepath: str) -> pd.DataFrame:
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".csv":
@@ -73,12 +93,20 @@ def match_drivers(weekly: pd.DataFrame):
     return matched, unmatched
  
  
-def commit_to_database(week_number: int, matched: list) -> str:
+def commit_to_database(
+    week_number: int,
+    matched: list,
+    expense_file_date: Optional[str] = None,
+) -> str:
     """Creates the payment_run and job_expenses rows. Rolls back on failure."""
     run_id = None
     try:
         run = supabase.table("payment_runs").insert(
-            {"week_number": week_number, "status": "draft"}
+            {
+                "week_number": week_number,
+                "status": "draft",
+                "expense_file_date": expense_file_date,
+            }
         ).execute()
         run_id = run.data[0]["id"]
         log.info("Created payment_run %s for week %s", run_id, week_number)
@@ -143,7 +171,13 @@ def main():
         print("\nDry run only — nothing was written. Re-run with --commit to save this to the database.")
         return
  
-    run_id = commit_to_database(args.week, matched)
+    expense_file_date = parse_expense_date(args.file)
+    if not expense_file_date:
+        log.warning(
+            "No date found in filename '%s' — payment run will be saved with NULL expense_file_date.",
+            args.file,
+        )
+    run_id = commit_to_database(args.week, matched, expense_file_date)
     print(f"\nDone. payment_run id: {run_id}")
  
  

@@ -12,6 +12,7 @@
     <thead class="table-dark">
         <tr>
             <th>Week</th>
+            <th>Expense Date</th>
             <th class="text-end">Total (£)</th>
             <th>Status</th>
             <th>CSV</th>
@@ -22,6 +23,7 @@
         {% for run in runs %}
         <tr>
             <td>{{ run.week_number }}</td>
+            <td>{{ run.expense_file_date|date_only }}</td>
             <td class="text-end">{{ "%.2f"|format(run.total_amount or 0) }}</td>
             <td>
                 {% if run.status == "generated" %}
