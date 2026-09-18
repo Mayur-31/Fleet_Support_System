@@ -1,26 +1,36 @@
 """
 Bank Report Parser for Fleet Support System.
 
-Reads the bank's post-payment Excel report (4 sheets):
-- Driver Type Summary
-- Unmatched Lines
-- Driver Week Breakdown
-- Matched Paid Driver Lines
+Supports two input formats:
 
-Validates structure, extracts data, and returns a clean dictionary.
-Does NOT write to the database — that's the processor's job.
+1. Raw bank portal report — "Transaction Initiation Detail Report".
+   Single sheet. Metadata block, header row, payment rows, totals block.
+
+2. Legacy 4-sheet report from the old back office:
+   - Driver Type Summary
+   - Unmatched Lines
+   - Driver Week Breakdown
+   - Matched Paid Driver Lines
+
+Both produce the same internal structure, so the processor needs no
+format-specific code.
 
 Usage:
     from bank_report_parser import parse_bank_report
-    data = parse_bank_report("data/FLT_19.08.2026_2.xlsx")
+    data = parse_bank_report("data/FLT 18.09.2026.xlsx")
 """
 import math
+import re
 import json
+import hashlib
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
 
-# Required sheets (exact names from Charlotte's sample)
+
+# ============================================================
+# Legacy 4-sheet format
+# ============================================================
 REQUIRED_SHEETS = {
     "Driver Type Summary",
     "Unmatched Lines",
@@ -28,66 +38,61 @@ REQUIRED_SHEETS = {
     "Matched Paid Driver Lines",
 }
 
-# Minimum required columns for Matched Paid Driver Lines
-# (we only check these exist; extra columns are ignored)
 MATCHED_PAID_MIN_COLUMNS = {
     "Id", "RowNumber", "DriverInvoiceId", "BankExecutionDate",
     "BeneficiaryName", "BeneficiaryAmount", "PaymentRef",
     "DriverReference", "WeekNumber", "BankSort", "BankAccount"
 }
 
-# Minimum required columns for Unmatched Lines
 UNMATCHED_MIN_COLUMNS = {
     "Id", "RowNumber", "BeneficiaryName", "BeneficiaryAmount",
     "BankSort", "BankAccount"
 }
 
 
+# ============================================================
+# Raw bank portal format markers
+# ============================================================
+RAW_TITLE_MARKER = "Transaction Initiation Detail Report"
+RAW_HEADER_MARKER = "Beneficiary Bank Identifier"
+
+RAW_END_MARKERS = (
+    "Total Amount (Base",
+    "Number of Transactions",
+    "Total By",
+    "Total Number of Transactions",
+    "Cross-currency calculations",
+    "Filters have been applied",
+    "SELECTION CRITERIA",
+)
+
+
+# ============================================================
+# Shared helpers
+# ============================================================
+def _is_missing(value):
+    """More robust than a plain `isinstance(value, float) and isnan()` check."""
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def _clean_nans(records: list) -> list:
-    """
-    Converts NaN -> None on already-materialized dicts.
-    
-    Why this is needed:
-    Using df.where(pd.notnull(df), None).to_dict(orient="records") looks
-    correct, but pandas preserves the float dtype for numeric columns.
-    The None gets silently coerced back to float('nan') to maintain the dtype.
-    
-    This function iterates over the finalized dicts (where pandas' dtype
-    coercion no longer applies) and replaces any float('nan') with None.
-    
-    Args:
-        records: List of dicts from pandas .to_dict(orient="records")
-    
-    Returns:
-        List of dicts with NaN values replaced by None
-    """
     cleaned = []
     for record in records:
         clean_record = {}
         for key, value in record.items():
-            # Check if it's a float and is NaN (including numpy.nan)
-            if isinstance(value, float) and math.isnan(value):
-                clean_record[key] = None
-            else:
-                clean_record[key] = value
+            clean_record[key] = None if _is_missing(value) else value
         cleaned.append(clean_record)
     return cleaned
 
 
 def _normalize_dates(records: list, date_keys: list) -> list:
-    """
-    Converts pandas Timestamp objects to ISO 8601 date strings.
-    
-    This ensures the JSON serialization test (allow_nan=False) doesn't
-    fail because of pandas Timestamp objects (which are not JSON-serializable).
-    
-    Args:
-        records: List of dicts
-        date_keys: List of keys that contain dates (e.g., ["BankExecutionDate"])
-    
-    Returns:
-        List of dicts with dates normalized to ISO strings
-    """
     normalized = []
     for record in records:
         clean_record = {}
@@ -100,33 +105,124 @@ def _normalize_dates(records: list, date_keys: list) -> list:
     return normalized
 
 
+def _to_str(value):
+    if _is_missing(value):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _strip_html(text):
+    if not text:
+        return text
+    text = re.sub(r"<[^>]+>", " ", str(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _parse_amount(value):
+    if _is_missing(value):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace(",", "").replace("£", "").replace("\xa0", "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_date(value):
+    if _is_missing(value):
+        return None
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, str):
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.strip(), fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+    return None
+
+
+def _split_sort_account(value):
+    text = _to_str(value)
+    if not text or "/" not in text:
+        return None, None
+    parts = [p.strip() for p in text.split("/")]
+    if len(parts) == 2 and parts[0] and parts[1]:
+        return parts[0], parts[1]
+    return None, None
+
+
+def _parse_ref(ref):
+    if not ref:
+        return None, None
+    m = re.match(r"^WK(\d+)-(.+)$", str(ref).strip(), re.IGNORECASE)
+    if m:
+        return int(m.group(1)), m.group(2).strip()
+    return None, None
+
+
+def _get_cell(row_list, idx):
+    if idx is None or idx >= len(row_list):
+        return None
+    return row_list[idx]
+
+
+# ============================================================
+# Format detection
+# ============================================================
+def _detect_format(excel_file: pd.ExcelFile) -> str:
+    sheets = set(excel_file.sheet_names)
+
+    if REQUIRED_SHEETS.issubset(sheets):
+        return "legacy"
+
+    if len(sheets) == 1:
+        try:
+            preview = pd.read_excel(
+                excel_file, sheet_name=excel_file.sheet_names[0],
+                header=None, nrows=15,
+            )
+        except Exception:
+            preview = None
+        if preview is not None:
+            for cell in preview.values.flatten():
+                if isinstance(cell, str) and RAW_TITLE_MARKER in cell:
+                    return "raw"
+
+    raise ValueError(
+        f"Unrecognised bank report format. Sheets found: {excel_file.sheet_names}. "
+        f"Expected either the legacy 4-sheet report ({sorted(REQUIRED_SHEETS)}) "
+        f"or the raw bank portal report containing the text "
+        f"'{RAW_TITLE_MARKER}'."
+    )
+
+
+# ============================================================
+# Public entry point
+# ============================================================
 def parse_bank_report(file_path: str) -> dict:
-    """
-    Parses the bank report Excel file and returns structured data.
-
-    Returns:
-        dict: {
-            "summary": list of dicts (Driver Type Summary),
-            "unmatched_lines": list of dicts,
-            "week_breakdown_raw": dict with "headers" and "rows" (positional),
-            "matched_paid_lines": list of dicts,
-            "sheets_found": list of sheet names
-        }
-
-    Raises:
-        ValueError: If file is missing required sheets or columns.
-        FileNotFoundError: If file doesn't exist.
-    """
     file_path = Path(file_path)
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    # Read all sheets
+    excel_file = pd.ExcelFile(file_path)
+    fmt = _detect_format(excel_file)
+
+    if fmt == "legacy":
+        return _parse_legacy_format(file_path)
+    return _parse_raw_format(file_path, excel_file)
+
+
+# ============================================================
+# Legacy 4-sheet parser (unchanged behaviour)
+# ============================================================
+def _parse_legacy_format(file_path: Path) -> dict:
     excel_file = pd.ExcelFile(file_path)
     sheets_found = excel_file.sheet_names
-    missing_sheets = REQUIRED_SHEETS - set(sheets_found)
-    if missing_sheets:
-        raise ValueError(f"Missing required sheet(s): {missing_sheets}")
 
     result = {
         "summary": [],
@@ -134,18 +230,12 @@ def parse_bank_report(file_path: str) -> dict:
         "week_breakdown_raw": {},
         "matched_paid_lines": [],
         "sheets_found": sheets_found,
+        "source_format": "legacy_4sheet",
     }
 
-    # ============================================================
-    # 1. Driver Type Summary
-    # ============================================================
     df_summary = pd.read_excel(file_path, sheet_name="Driver Type Summary")
-    summary_records = df_summary.to_dict(orient="records")
-    result["summary"] = _clean_nans(summary_records)
+    result["summary"] = _clean_nans(df_summary.to_dict(orient="records"))
 
-    # ============================================================
-    # 2. Unmatched Lines
-    # ============================================================
     df_unmatched = pd.read_excel(file_path, sheet_name="Unmatched Lines")
     missing_cols = UNMATCHED_MIN_COLUMNS - set(df_unmatched.columns)
     if missing_cols:
@@ -153,24 +243,17 @@ def parse_bank_report(file_path: str) -> dict:
             f"Unmatched Lines sheet missing required column(s): {missing_cols}\n"
             f"Found: {list(df_unmatched.columns)}"
         )
-    unmatched_records = df_unmatched.to_dict(orient="records")
-    result["unmatched_lines"] = _clean_nans(unmatched_records)
+    result["unmatched_lines"] = _clean_nans(df_unmatched.to_dict(orient="records"))
+    result["unmatched_lines"] = _normalize_dates(
+        result["unmatched_lines"], ["BankExecutionDate"]
+    )
 
-    # Normalize dates in Unmatched Lines (BankExecutionDate)
-    result["unmatched_lines"] = _normalize_dates(result["unmatched_lines"], ["BankExecutionDate"])
-
-    # ============================================================
-    # 3. Driver Week Breakdown (positional parsing)
-    # ============================================================
-    # This sheet has duplicate column names ("Week", "Amount" repeated 3 times).
-    # We read it without headers and parse positionally.
-    df_breakdown = pd.read_excel(file_path, sheet_name="Driver Week Breakdown", header=None)
-
+    df_breakdown = pd.read_excel(
+        file_path, sheet_name="Driver Week Breakdown", header=None
+    )
     if len(df_breakdown) > 0:
         header_row = df_breakdown.iloc[0].tolist()
-        # Create unique column names: if duplicate, add suffix
-        col_names = []
-        seen = {}
+        col_names, seen = [], {}
         for col in header_row:
             if col in seen:
                 seen[col] += 1
@@ -178,28 +261,17 @@ def parse_bank_report(file_path: str) -> dict:
             else:
                 seen[col] = 0
                 col_names.append(str(col))
-        # Read the data rows (index 1 onwards)
         data_rows = df_breakdown.iloc[1:].values.tolist()
-        # Convert to list of dicts with the generated column names
         week_data = []
         for row in data_rows:
-            if any(pd.notnull(x) for x in row):  # skip empty rows
+            if any(pd.notnull(x) for x in row):
                 row_dict = {}
                 for i, val in enumerate(row):
                     if i < len(col_names):
-                        if pd.isna(val):
-                            row_dict[col_names[i]] = None
-                        else:
-                            row_dict[col_names[i]] = val
+                        row_dict[col_names[i]] = None if _is_missing(val) else val
                 week_data.append(row_dict)
-        result["week_breakdown_raw"] = {
-            "headers": col_names,
-            "rows": week_data
-        }
+        result["week_breakdown_raw"] = {"headers": col_names, "rows": week_data}
 
-    # ============================================================
-    # 4. Matched Paid Driver Lines
-    # ============================================================
     df_matched = pd.read_excel(file_path, sheet_name="Matched Paid Driver Lines")
     missing_cols = MATCHED_PAID_MIN_COLUMNS - set(df_matched.columns)
     if missing_cols:
@@ -207,20 +279,166 @@ def parse_bank_report(file_path: str) -> dict:
             f"Matched Paid Driver Lines sheet missing required column(s): {missing_cols}\n"
             f"Found: {list(df_matched.columns)}"
         )
-    matched_records = df_matched.to_dict(orient="records")
-    result["matched_paid_lines"] = _clean_nans(matched_records)
-
-    # Normalize dates in Matched Paid Driver Lines
-    result["matched_paid_lines"] = _normalize_dates(result["matched_paid_lines"], ["BankExecutionDate"])
+    result["matched_paid_lines"] = _clean_nans(df_matched.to_dict(orient="records"))
+    result["matched_paid_lines"] = _normalize_dates(
+        result["matched_paid_lines"], ["BankExecutionDate"]
+    )
 
     return result
 
 
+# ============================================================
+# Raw bank portal parser
+# ============================================================
+def _parse_raw_format(file_path: Path, excel_file: pd.ExcelFile) -> dict:
+    raw = pd.read_excel(excel_file, sheet_name=excel_file.sheet_names[0], header=None)
+
+    # 1. Locate the header row
+    header_row_idx = None
+    for i in range(len(raw)):
+        row = raw.iloc[i]
+        for cell in row:
+            if isinstance(cell, str) and RAW_HEADER_MARKER in cell:
+                header_row_idx = i
+                break
+        if header_row_idx is not None:
+            break
+
+    if header_row_idx is None:
+        raise ValueError(
+            f"Could not find the '{RAW_HEADER_MARKER}' header row in the bank file. "
+            f"This may not be a complete Transaction Initiation Detail Report."
+        )
+
+    # 2. Build column-name → index map
+    header_row = raw.iloc[header_row_idx]
+    col_map = {}
+    for idx, cell in enumerate(header_row):
+        text = _strip_html(_to_str(cell))
+        if not text:
+            continue
+        if RAW_HEADER_MARKER in text:
+            col_map.setdefault("beneficiary_account", idx)
+        elif text.startswith("Beneficiary Amount"):
+            col_map.setdefault("beneficiary_amount", idx)
+        elif "Beneficiary Name" in text:
+            col_map.setdefault("beneficiary_name", idx)
+        elif "Payment Reference" in text:
+            col_map.setdefault("payment_reference", idx)
+        elif "Beneficiary Status" in text:
+            col_map.setdefault("beneficiary_status", idx)
+
+    required = ["beneficiary_account", "beneficiary_amount", "payment_reference"]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        raise ValueError(
+            f"Bank file header row is missing required column(s): {missing}."
+        )
+
+    # 3. Read metadata above the header
+    value_date = None
+    transaction_ref = None
+    for i in range(header_row_idx):
+        row_values = raw.iloc[i].tolist()
+        for j, cell in enumerate(row_values):
+            if not isinstance(cell, str):
+                continue
+            label = cell.strip()
+            if label == "Value Date" and value_date is None:
+                for k in range(j + 1, len(row_values)):
+                    parsed = _parse_date(row_values[k])
+                    if parsed:
+                        value_date = parsed
+                        break
+            elif label == "Transaction Reference Number" and transaction_ref is None:
+                for k in range(j + 1, len(row_values)):
+                    candidate = _to_str(row_values[k])
+                    if candidate:
+                        transaction_ref = candidate
+                        break
+
+    # 4. Read data rows
+    payment_lines = []
+    for i in range(header_row_idx + 1, len(raw)):
+        row_values = raw.iloc[i].tolist()
+
+        first_text = None
+        for cell in row_values:
+            text = _strip_html(_to_str(cell))
+            if text:
+                first_text = text
+                break
+        if first_text and any(m in first_text for m in RAW_END_MARKERS):
+            break
+
+        ref = _to_str(_get_cell(row_values, col_map["payment_reference"]))
+        if not ref:
+            continue
+
+        account_cell = _get_cell(row_values, col_map["beneficiary_account"])
+        sort_code, account_number = _split_sort_account(account_cell)
+
+        amount = _parse_amount(_get_cell(row_values, col_map["beneficiary_amount"]))
+
+        name = None
+        if "beneficiary_name" in col_map:
+            name = _strip_html(_to_str(_get_cell(row_values, col_map["beneficiary_name"])))
+
+        status = None
+        if "beneficiary_status" in col_map:
+            status = _to_str(_get_cell(row_values, col_map["beneficiary_status"]))
+
+        week_number, driver_reference = _parse_ref(ref)
+
+        # Idempotency key: payment ref + account + amount + value date.
+        # Deliberately excludes the file-level transaction reference, which
+        # the bank may regenerate when the same report is re-downloaded.
+        account_key = account_number or "noacct"
+        amount_key = f"{amount:.2f}" if amount is not None else "noamt"
+        raw_key = f"{ref}|{account_key}|{amount_key}|{value_date or 'nodate'}"
+        bank_line_id = hashlib.sha256(raw_key.encode()).hexdigest()[:32]
+
+        payment_lines.append({
+            "Id": bank_line_id,
+            "RowNumber": i + 1,
+            "DriverInvoiceId": None,
+            "BankExecutionDate": value_date,
+            "BeneficiaryName": name,
+            "BeneficiaryAmount": amount,
+            "PaymentRef": ref,
+            "BeneficiaryStatus": status,
+            "DriverType": None,
+            "DriverId": None,
+            "DriverReference": driver_reference,
+            "DriverName": name,
+            "InvoiceType": None,
+            "WeekNumber": week_number,
+            "BeneficiaryStatusAdditionalInfo": None,
+            "Note": None,
+            "BankSort": sort_code,
+            "BankAccount": account_number,
+        })
+
+    if not payment_lines:
+        raise ValueError(
+            "No payment lines could be extracted from the bank file. "
+            "Check that the file is a complete Transaction Initiation Detail Report."
+        )
+
+    return {
+        "summary": [],
+        "unmatched_lines": [],
+        "week_breakdown_raw": {},
+        "matched_paid_lines": payment_lines,
+        "sheets_found": excel_file.sheet_names,
+        "source_format": "raw_bank_portal",
+    }
+
+
+# ============================================================
+# Preserved helpers (unchanged API)
+# ============================================================
 def validate_file_structure(file_path: str) -> dict:
-    """
-    Lightweight validation: just checks sheets and basic headers.
-    Returns a dict with "valid": bool, "data": dict (if valid), "errors": list.
-    """
     try:
         data = parse_bank_report(file_path)
         return {"valid": True, "data": data, "errors": []}
@@ -231,16 +449,6 @@ def validate_file_structure(file_path: str) -> dict:
 
 
 def check_idempotency_ready(data: dict) -> dict:
-    """
-    Checks if the bank report's Id column is suitable for idempotency.
-    Scans BOTH matched_paid_lines and unmatched_lines together.
-
-    Returns a dict with:
-        - "all_have_id": bool
-        - "blank_rows": dict with sheet_name -> list of row numbers
-        - "unique_ids": bool
-        - "duplicates": list of duplicate Id values
-    """
     matched_lines = data.get("matched_paid_lines", [])
     unmatched_lines = data.get("unmatched_lines", [])
 
@@ -251,35 +459,24 @@ def check_idempotency_ready(data: dict) -> dict:
         "duplicates": [],
     }
 
-    # Check Matched Paid Driver Lines
     for i, row in enumerate(matched_lines, start=2):
-        line_id = row.get("Id")
-        if line_id is None or str(line_id).strip() == "":
+        if not row.get("Id"):
             results["all_have_id"] = False
             results["blank_rows"]["matched_paid_driver_lines"].append(i)
 
-    # Check Unmatched Lines
     for i, row in enumerate(unmatched_lines, start=2):
-        line_id = row.get("Id")
-        if line_id is None or str(line_id).strip() == "":
+        if not row.get("Id"):
             results["all_have_id"] = False
             results["blank_rows"]["unmatched_lines"].append(i)
 
-    # Collect ALL IDs (from both sheets) to check for duplicates across the entire report
     all_ids = []
-    for row in matched_lines:
-        line_id = row.get("Id")
-        if line_id is not None and str(line_id).strip() != "":
-            all_ids.append(line_id)
-    for row in unmatched_lines:
-        line_id = row.get("Id")
-        if line_id is not None and str(line_id).strip() != "":
-            all_ids.append(line_id)
+    for row in matched_lines + unmatched_lines:
+        if row.get("Id"):
+            all_ids.append(row["Id"])
 
     if len(all_ids) != len(set(all_ids)):
         results["unique_ids"] = False
-        seen = set()
-        duplicates = set()
+        seen, duplicates = set(), set()
         for line_id in all_ids:
             if line_id in seen:
                 duplicates.add(line_id)
@@ -290,7 +487,7 @@ def check_idempotency_ready(data: dict) -> dict:
 
 
 # ============================================================
-# Quick test when run directly
+# CLI test harness
 # ============================================================
 if __name__ == "__main__":
     import sys
@@ -303,79 +500,34 @@ if __name__ == "__main__":
     print(f"📂 Parsing: {file_path}\n")
 
     try:
-        # 1. Parse the file
         result = parse_bank_report(file_path)
-
-        print("✅ Parsing successful!\n")
-
-        # 2. Summary stats
+        fmt = result.get("source_format", "unknown")
+        print(f"✅ Parsing successful (format: {fmt})\n")
         print(f"  Sheets found: {result['sheets_found']}")
-        print(f"  Driver Type Summary rows: {len(result['summary'])}")
-        print(f"  Unmatched Lines rows: {len(result['unmatched_lines'])}")
-        print(f"  Week Breakdown rows: {len(result['week_breakdown_raw'].get('rows', []))}")
-        print(f"  Matched Paid Driver Lines rows: {len(result['matched_paid_lines'])}")
+        print(f"  Matched Paid rows: {len(result['matched_paid_lines'])}")
+        print(f"  Unmatched rows: {len(result['unmatched_lines'])}")
 
-        # 3. Idempotency check (now covers both sheets)
-        print("\n🔍 Idempotency Check:")
+        print("\n🔍 Idempotency check:")
         id_check = check_idempotency_ready(result)
+        print(f"  All rows have Id: {id_check['all_have_id']}")
+        print(f"  All Ids unique: {id_check['unique_ids']}")
 
-        if not id_check["all_have_id"]:
-            for sheet, rows in id_check["blank_rows"].items():
-                if rows:
-                    print(f"  ⚠️ WARNING: {sheet} has {len(rows)} blank Id values at rows: {rows}")
-        else:
-            print("  ✅ All rows across both sheets have an Id value.")
-
-        if not id_check["unique_ids"]:
-            print(f"  ⚠️ WARNING: Duplicate Id values found across the report: {id_check['duplicates']}")
-        else:
-            print("  ✅ All Id values are unique across both sheets.")
-
-        # 4. Sample from Matched Paid Driver Lines
         if result["matched_paid_lines"]:
-            print("\n📄 Sample Matched Paid Driver Lines (first 2 rows):")
-            for idx, row in enumerate(result["matched_paid_lines"][:2], 1):
+            print("\n📄 First 3 lines:")
+            for idx, row in enumerate(result["matched_paid_lines"][:3], 1):
                 print(f"\n  Row {idx}:")
-                print(f"    Id: {row.get('Id')}")
-                print(f"    DriverReference: {row.get('DriverReference')}")
-                print(f"    WeekNumber: {row.get('WeekNumber')}")
-                print(f"    BeneficiaryAmount: {row.get('BeneficiaryAmount')}")
-                print(f"    DriverInvoiceId: {row.get('DriverInvoiceId')}")
-                print(f"    PaymentRef: {row.get('PaymentRef')}")
+                for k in ("Id", "PaymentRef", "DriverReference", "WeekNumber",
+                          "BeneficiaryAmount", "BankSort", "BankAccount",
+                          "BeneficiaryName", "BankExecutionDate"):
+                    print(f"    {k}: {row.get(k)}")
 
-        # 5. Sample Unmatched Lines (CRITICAL: Check NaN -> None fix)
-        if result["unmatched_lines"]:
-            print("\n📄 Sample Unmatched Lines (first row):")
-            row = result["unmatched_lines"][0]
-            print(f"    BeneficiaryName: {row.get('BeneficiaryName')}")
-            print(f"    BeneficiaryAmount: {row.get('BeneficiaryAmount')}")
-            print(f"    Note: {row.get('Note')}")  # Should print "None", not "nan"
-
-        # 6. JSON Serialization Test (STRICT: no default=str)
-        print("\n🔬 JSON Serialization Test:")
+        print("\n🔬 JSON serialization test:")
         try:
-            # allow_nan=False will raise ValueError if any NaN is present
-            # No default=str so dates must be normalized
-            json_string = json.dumps(result, allow_nan=False)
-            print("  ✅ JSON serialization PASSED (no NaN values found).")
-        except ValueError as e:
-            print(f"  ❌ JSON serialization FAILED: {e}")
-            print("     The parser still contains NaN values. Fix them before proceeding.")
+            json.dumps(result, allow_nan=False)
+            print("  ✅ PASSED")
+        except (ValueError, TypeError) as e:
+            print(f"  ❌ FAILED: {e}")
             sys.exit(1)
-        except TypeError as e:
-            print(f"  ❌ JSON serialization FAILED due to unsupported type: {e}")
-            print("     This likely means a pandas Timestamp or other non-serializable object slipped through.")
-            print("     Check the _normalize_dates() function.")
-            sys.exit(1)
-
-        # 7. Final recommendation
-        print("\n" + "=" * 60)
-        if id_check["all_have_id"] and id_check["unique_ids"]:
-            print("✅ Parser ready — Id column is suitable for idempotency.")
-            print("   Proceed to build the processor.")
-        else:
-            print("⚠️ Idempotency issues detected. Review warnings above.")
-            print("   The processor will need to handle these edge cases.")
 
     except FileNotFoundError as e:
         print(f"❌ File not found: {e}")
@@ -384,7 +536,7 @@ if __name__ == "__main__":
         print(f"❌ Validation error: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
         import traceback
+        print(f"❌ Unexpected error: {e}")
         traceback.print_exc()
         sys.exit(1)

@@ -19,6 +19,18 @@ checked before any write happens -- the whole commit is refused rather
 than partially applied, since bank_line_id is the idempotency key and
 a same-file collision means something is wrong with the export itself,
 not something to paper over line by line.
+
+Multi-run-per-week reconciliation:
+    A single week may deliberately contain several payment runs (e.g.
+    separate Friday / Saturday / Sunday uploads, all with week_number=37
+    and different expense_file_date values). The processor therefore
+    fetches every payment_run for the week and disambiguates each bank
+    line individually:
+        Week + Driver  ->  candidate expenses across all runs
+        Amount         ->  filter
+        Bank date      ->  break ties (prefers expense_file_date + 1 day,
+                            the documented workflow), then same day,
+                            then leaves ambiguous if still >1.
 """
 import os
 import sys
@@ -62,17 +74,19 @@ def normalize_amount(value):
 
 
 def get_week_from_lines(parsed):
-    """Only Matched Paid Driver Lines determine the week -- Unmatched
-    Lines has no WeekNumber column at all in the real file structure."""
+    """Only matched lines determine the week -- unmatched lines (when present)
+    have no WeekNumber column in the raw bank file."""
     weeks_seen = set()
     for line in parsed.get('matched_paid_lines', []):
         week = line.get('WeekNumber')
         if week is not None:
             weeks_seen.add(int(week))
     if not weeks_seen:
-        raise ValueError("No WeekNumber found in Matched Paid Driver Lines.")
+        raise ValueError("No WeekNumber found in Matched Paid lines.")
     if len(weeks_seen) > 1:
-        raise ValueError(f"File contains multiple week numbers: {sorted(weeks_seen)} -- expected one.")
+        raise ValueError(
+            f"File contains multiple week numbers: {sorted(weeks_seen)} -- expected one."
+        )
     return weeks_seen.pop()
 
 
@@ -83,6 +97,68 @@ def get_response_data(response):
 def _get_existing_bank_line_ids():
     rows = supabase.table("bank_report_lines").select("bank_line_id").execute().data
     return {r["bank_line_id"] for r in rows}
+
+
+def _narrow_by_date(candidate_expenses, bank_date_iso, payment_runs):
+    """
+    Narrow amount-matching expenses using the bank value date vs each
+    candidate's payment_run.expense_file_date.
+
+    Order of preference (Fleet Support workflow):
+      1. bank_date == expense_file_date + 1   (normal next-day)
+      2. bank_date == expense_file_date        (same-day, rare)
+    Reverse-date (-1) is NOT accepted: unconfirmed by the business and
+    could silently match the wrong run. Larger deltas (weekend, bank
+    holidays) are not filtered here -- they surface via the reason string
+    so Charlotte can review them on the preview page.
+    """
+    if not bank_date_iso:
+        return candidate_expenses
+
+    try:
+        bank_date = datetime.strptime(bank_date_iso, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return candidate_expenses
+
+    one_after, exact = [], []
+    for exp in candidate_expenses:
+        run_date_str = payment_runs.get(exp["payment_run_id"])
+        if not run_date_str:
+            continue
+        try:
+            run_date = datetime.strptime(str(run_date_str), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        delta = (bank_date - run_date).days
+        if delta == 1:
+            one_after.append(exp)
+        elif delta == 0:
+            exact.append(exp)
+
+    for bucket in (one_after, exact):
+        if len(bucket) == 1:
+            return bucket
+        if len(bucket) > 1:
+            return bucket
+
+    return candidate_expenses
+
+
+def _format_delta(bank_date_iso, expense_date_str):
+    """Short '(bank date = expense date + N days)' suffix, or ''."""
+    if not bank_date_iso or not expense_date_str:
+        return ""
+    try:
+        bd = datetime.strptime(bank_date_iso, "%Y-%m-%d").date()
+        ed = datetime.strptime(str(expense_date_str), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return ""
+    d = (bd - ed).days
+    if d == 0:
+        return ", same day"
+    if d > 0:
+        return f", +{d} day" + ("s" if d != 1 else "")
+    return f", {d} day" + ("s" if d != -1 else "")
 
 
 def process_bank_report(file_path, uploaded_by, dry_run=True):
@@ -120,26 +196,31 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
         result["errors"].append(f"Week detection error: {e}")
         return result
 
+    # ---- Fetch every payment run for this week (there may be several) ----
     try:
-        pr_resp = supabase.table("payment_runs").select("id").eq("week_number", week_number).execute()
+        pr_resp = (
+            supabase.table("payment_runs")
+            .select("id, expense_file_date")
+            .eq("week_number", week_number)
+            .execute()
+        )
         pr_rows = get_response_data(pr_resp)
         if not pr_rows:
             result["errors"].append(f"No payment run found for week {week_number}.")
             return result
-        if len(pr_rows) > 1:
-            ids = [row["id"] for row in pr_rows]
-            result["errors"].append(f"Multiple payment runs for week {week_number}. Ambiguous. IDs: {ids}")
-            return result
-        payment_run_id = pr_rows[0]["id"]
-        result["payment_run_id"] = payment_run_id
+        payment_runs = {row["id"]: row.get("expense_file_date") for row in pr_rows}
+        payment_run_ids = list(payment_runs.keys())
+        result["payment_run_id"] = payment_run_ids[0]
     except Exception as e:
         result["errors"].append(f"Payment run lookup error: {e}")
         return result
 
     existing_ids = _get_existing_bank_line_ids() if not dry_run else set()
+    rows_to_write = []
 
-    rows_to_write = []  # only lines with a non-blank bank_line_id land here
-
+    # ============================================================
+    # Matched lines (from the raw bank file, all payment rows land here)
+    # ============================================================
     for line in matched_lines:
         bank_line_id = str(line.get("Id", "")).strip()
         driver_ref = str(line.get("DriverReference") or "").strip() or None
@@ -150,7 +231,8 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
             result["preview_lines"].append({
                 "bank_line_id": "", "driver_reference": driver_ref,
                 "beneficiary_amount": str(bank_amount) if bank_amount is not None else None,
-                "status": "skipped", "reason": "Missing bank line Id -- not written, no idempotency key.",
+                "status": "skipped",
+                "reason": "Missing bank line Id -- not written, no idempotency key.",
                 "candidate_expense_id": None,
             })
             continue
@@ -168,32 +250,116 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
                 status, reason = "ambiguous", "Multiple drivers found"
             else:
                 driver_id = drv_rows[0]["id"]
-                exp_resp = supabase.table("job_expenses").select("id, amount, status") \
-                    .eq("driver_id", driver_id).eq("payment_run_id", payment_run_id).execute()
+
+                # Every expense for this driver across every run in this week.
+                exp_resp = (
+                    supabase.table("job_expenses")
+                    .select("id, amount, status, payment_run_id")
+                    .eq("driver_id", driver_id)
+                    .in_("payment_run_id", payment_run_ids)
+                    .execute()
+                )
                 expenses = get_response_data(exp_resp)
 
                 if len(expenses) == 0:
-                    status, reason = "unmatched", "No expense found"
-                elif len(expenses) > 1:
-                    status, reason = "ambiguous", "Multiple expenses found"
+                    status, reason = "unmatched", "No expense found for driver in this week"
                 else:
-                    expense = expenses[0]
-                    expense_amount = normalize_amount(expense.get("amount"))
-                    matched_expense_id = expense["id"]
+                    # ---- Step 1: filter by amount ----
+                    amount_matches = []
+                    for exp in expenses:
+                        expense_amount = normalize_amount(exp.get("amount"))
+                        if (
+                            bank_amount is not None
+                            and expense_amount is not None
+                            and abs(expense_amount - bank_amount) <= AMOUNT_TOLERANCE
+                        ):
+                            amount_matches.append(exp)
 
                     if bank_amount is None:
                         status, reason = "amount_mismatch", "Invalid/unparseable bank amount"
-                    elif expense_amount is None:
-                        status, reason = "amount_mismatch", "Invalid/unparseable stored amount"
-                    elif abs(expense_amount - bank_amount) <= AMOUNT_TOLERANCE:
-                        status = "matched"
-                        reason = (
-                            "Already marked paid by a previous bank report -- recorded again, not re-applied."
-                            if expense["status"] == "paid" else "Amount matches"
-                        )
+
+                    elif len(amount_matches) == 0:
+                        if len(expenses) == 1:
+                            exp_amt = normalize_amount(expenses[0].get("amount"))
+                            status = "amount_mismatch"
+                            reason = f"Bank {bank_amount} vs stored {exp_amt}"
+                        else:
+                            status = "amount_mismatch"
+                            reason = (
+                                f"Bank {bank_amount} matches none of "
+                                f"{len(expenses)} candidate expense(s) for this driver"
+                            )
+
+                    elif len(amount_matches) == 1:
+                        # Single amount match: accept only if the date
+                        # relationship is consistent with the documented
+                        # workflow (+1 day or same day). Any other delta
+                        # is flagged as ambiguous so Charlotte can review.
+                        expense = amount_matches[0]
+                        exp_date = payment_runs.get(expense["payment_run_id"])
+
+                        delta_days = None
+                        if line.get("BankExecutionDate") and exp_date:
+                            try:
+                                bd = datetime.strptime(line["BankExecutionDate"], "%Y-%m-%d").date()
+                                ed = datetime.strptime(str(exp_date), "%Y-%m-%d").date()
+                                delta_days = (bd - ed).days
+                            except (ValueError, TypeError):
+                                pass
+
+                        if delta_days in (0, 1):
+                            matched_expense_id = expense["id"]
+                            status = "matched"
+                            delta_str = _format_delta(line.get("BankExecutionDate"), exp_date)
+                            if expense["status"] == "paid":
+                                reason = (
+                                    f"Already marked paid by a previous bank report "
+                                    f"(expense_file_date={exp_date}{delta_str})."
+                                )
+                            else:
+                                reason = (
+                                    f"Amount matches (expense_file_date={exp_date}{delta_str})."
+                                )
+                        else:
+                            status = "ambiguous"
+                            reason = (
+                                f"Amount matches but date delta is {delta_days} days "
+                                f"(bank {line.get('BankExecutionDate')} vs "
+                                f"expense_file_date {exp_date}) — needs manual review."
+                            )
+
                     else:
-                        status = "amount_mismatch"
-                        reason = f"Bank {bank_amount} vs stored {expense_amount}"
+                        # Multiple amount matches: use date to narrow.
+                        date_matches = _narrow_by_date(
+                            amount_matches, line.get("BankExecutionDate"), payment_runs
+                        )
+
+                        if len(date_matches) == 1:
+                            expense = date_matches[0]
+                            matched_expense_id = expense["id"]
+                            status = "matched"
+                            exp_date = payment_runs.get(expense["payment_run_id"])
+                            delta_str = _format_delta(line.get("BankExecutionDate"), exp_date)
+                            if expense["status"] == "paid":
+                                reason = (
+                                    f"Already marked paid by a previous bank report "
+                                    f"(date-disambiguated, expense_file_date={exp_date}{delta_str})."
+                                )
+                            else:
+                                reason = (
+                                    f"Amount matches and disambiguated by date "
+                                    f"(expense_file_date={exp_date}{delta_str})."
+                                )
+                        else:
+                            candidate_dates = sorted({
+                                str(payment_runs.get(e["payment_run_id"]))
+                                for e in amount_matches
+                            })
+                            status = "ambiguous"
+                            reason = (
+                                f"{len(amount_matches)} expenses with the same amount "
+                                f"across runs with expense_file_date={candidate_dates}"
+                            )
 
         result[f"{status}_count"] += 1
         row = {
@@ -223,6 +389,9 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
             "status": status, "reason": reason, "candidate_expense_id": matched_expense_id,
         })
 
+    # ============================================================
+    # Unmatched lines (only present in legacy 4-sheet files)
+    # ============================================================
     for line in unmatched_lines:
         bank_line_id = str(line.get("Id", "")).strip()
         bank_amount = normalize_amount(line.get("BeneficiaryAmount"))
@@ -232,7 +401,8 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
             result["preview_lines"].append({
                 "bank_line_id": "", "driver_reference": None,
                 "beneficiary_amount": str(bank_amount) if bank_amount is not None else None,
-                "status": "skipped", "reason": "Missing bank line Id -- not written, no idempotency key.",
+                "status": "skipped",
+                "reason": "Missing bank line Id -- not written, no idempotency key.",
                 "candidate_expense_id": None,
             })
             continue
@@ -260,14 +430,13 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
         result["preview_lines"].append({
             "bank_line_id": bank_line_id, "driver_reference": None,
             "beneficiary_amount": str(bank_amount) if bank_amount is not None else None,
-            "status": "not_applicable", "reason": row["reason"], "candidate_expense_id": None,
+            "status": "not_applicable", "reason": row["reason"],
+            "candidate_expense_id": None,
         })
 
-    # Duplicate bank_line_id WITHIN this file -- refuse the whole commit
-    # rather than partially apply it. A collision here means something
-    # is wrong with the export itself, not a per-line judgment call.
+    # Refuse the whole commit if the file contains duplicate ids within itself.
     id_counts = Counter(row["bank_line_id"] for row in rows_to_write)
-    duplicates = [bank_id for bank_id, count in id_counts.items() if count > 1]
+    duplicates = [bid for bid, count in id_counts.items() if count > 1]
     if duplicates:
         result["errors"].append(
             f"File contains duplicate bank_line_id value(s) within itself: {duplicates}. "
@@ -288,10 +457,6 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
         result["message"] = "All lines already processed in a previous run -- no new report created."
         return result
 
-    # Per-run counts (only what THIS run actually writes) -- kept separate
-    # from the full-file classification counts above, so a partial rerun
-    # (some lines already processed, some new) doesn't produce a
-    # bank_reports summary claiming more was written than actually was.
     run_counts = Counter(row["match_status"] for row in new_rows)
 
     try:
@@ -307,8 +472,10 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
             supabase.table("bank_report_lines").insert(row_with_report).execute()
 
             if row["match_status"] == "matched" and row["matched_job_expense_id"]:
-                current = supabase.table("job_expenses").select("status") \
+                current = (
+                    supabase.table("job_expenses").select("status")
                     .eq("id", row["matched_job_expense_id"]).execute().data[0]
+                )
                 if current["status"] != "paid":
                     supabase.table("job_expenses").update({"status": "paid"}) \
                         .eq("id", row["matched_job_expense_id"]).execute()
