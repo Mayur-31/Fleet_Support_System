@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}Weekly Report — Fleet Support Payments{% endblock %}
+
+{% block content %}
+<h1 class="mb-4">Weekly Report</h1>
+
+{% if not result %}
+<p class="text-muted">
+    Choose a payment week and download a report of all driver payments for that week.
+    The CSV matches the format of the old portal's Weekly Report.
+</p>
+
+<form method="post" class="card p-4" style="max-width:400px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="mb-3">
+        <label for="week_number" class="form-label">Payment week</label>
+        <select class="form-select" id="week_number" name="week_number" required>
+            <option value="">Choose a week…</option>
+            {% for w in weeks %}
+            <option value="{{ w }}">Week {{ w }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <button type="submit" class="btn btn-primary">Generate Report</button>
+</form>
+{% else %}
+<div class="alert alert-success">
+    <strong>Report ready.</strong>
+    Week {{ result.week_number }} — {{ result.row_count }} payments,
+    total £{{ "%.2f"|format(result.total_amount) }}.
+</div>
+<a href="{{ url_for('download_weekly_report', filename=result.filename) }}"
+   class="btn btn-primary">Download CSV</a>
+<a href="{{ url_for('weekly_report') }}" class="btn btn-outline-secondary">Generate another</a>
+{% endif %}
+
+<a href="{{ url_for('home') }}" class="btn btn-outline-secondary mt-3">Back to Home</a>
+{% endblock %}

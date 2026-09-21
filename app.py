@@ -21,6 +21,7 @@ from werkzeug.utils import secure_filename
 import auth
 import email_utils
 import generate_bank_csv
+import generate_weekly_report
 import import_expenses
 from config import FLASK_SECRET_KEY
 from database import supabase
@@ -522,6 +523,47 @@ def download_csv(filename):
         flash("That file could not be found.", "danger")
         return redirect(url_for("home"))
     return send_from_directory("output", safe_name, as_attachment=True)
+
+@app.route("/weekly-report", methods=["GET", "POST"])
+@auth.login_required
+def weekly_report():
+    if request.method == "GET":
+        runs = (
+            supabase.table("payment_runs")
+            .select("week_number")
+            .order("week_number", desc=True)
+            .execute()
+            .data
+        )
+        weeks = sorted({r["week_number"] for r in runs}, reverse=True)
+        return render_template("weekly_report.html", weeks=weeks, result=None)
+
+    week_str = request.form.get("week_number", "").strip()
+    if not week_str.isdigit():
+        flash("Please choose a week.", "danger")
+        return redirect(url_for("weekly_report"))
+
+    try:
+        result = generate_weekly_report.generate_weekly_report(int(week_str))
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("weekly_report"))
+    except Exception:
+        app.logger.exception("Weekly report generation failed")
+        flash("Something went wrong generating the report.", "danger")
+        return redirect(url_for("weekly_report"))
+
+    return render_template("weekly_report.html", weeks=None, result=result)
+
+
+@app.route("/weekly-report/download/<path:filename>")
+@auth.login_required
+def download_weekly_report(filename):
+    safe = secure_filename(filename)
+    if safe != filename or not os.path.exists(os.path.join("output", safe)):
+        flash("File not found.", "danger")
+        return redirect(url_for("weekly_report"))
+    return send_from_directory("output", safe, as_attachment=True)
 
 
 @app.route("/payment-runs")
