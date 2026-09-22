@@ -21,6 +21,7 @@ from werkzeug.utils import secure_filename
 import auth
 import email_utils
 import generate_bank_csv
+import generate_bank_report_summary
 import generate_weekly_report
 import import_expenses
 from config import FLASK_SECRET_KEY
@@ -674,7 +675,10 @@ def bank_report_confirm():
     original_result = preview.get('result', {})
 
     try:
-        commit_result = process_bank_report(file_path, user_id, dry_run=False)
+        commit_result = process_bank_report(
+            file_path, user_id, dry_run=False,
+            original_filename=preview.get("filename"),
+        )
 
         if commit_result.get('success'):
             delete_preview(token)
@@ -756,6 +760,26 @@ def bank_report_detail(report_id):
         lines = []
 
     return render_template('bank_report_detail.html', report=report, lines=lines)
+
+@app.route("/bank-reports/<uuid:report_id>/download")
+@auth.login_required
+@auth.active_user_required
+def download_bank_report_summary(report_id):
+    try:
+        result = generate_bank_report_summary.generate_bank_report_summary(
+            str(report_id)
+        )
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("bank_report_list"))
+    except Exception:
+        app.logger.exception("Bank report summary generation failed")
+        flash("Could not generate the reconciliation report.", "danger")
+        return redirect(url_for("bank_report_list"))
+
+    return send_from_directory(
+        "output", result["filename"], as_attachment=True
+    )
 
 @app.route("/admin/users/<user_id>/delete", methods=["POST"])
 @auth.login_required   # Explicitly check login first

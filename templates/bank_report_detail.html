@@ -70,6 +70,10 @@
         </label>
         <button type="submit" class="btn btn-danger">Delete Report</button>
     </form>
+    <a href="{{ url_for('download_bank_report_summary', report_id=report.id) }}"
+        class="btn btn-primary">
+            Download Reconciliation Report
+    </a>
     <a href="{{ url_for('bank_report_list') }}" class="btn btn-secondary">Back to Reports</a>
 </div>
 {% endblock %}

@@ -161,7 +161,7 @@ def _format_delta(bank_date_iso, expense_date_str):
     return f", {d} day" + ("s" if d != -1 else "")
 
 
-def process_bank_report(file_path, uploaded_by, dry_run=True):
+def process_bank_report(file_path, uploaded_by, dry_run=True, original_filename=None):
     result = {
         "success": False, "dry_run": dry_run, "message": "", "report_id": None,
         "week_number": None, "payment_run_id": None,
@@ -461,7 +461,7 @@ def process_bank_report(file_path, uploaded_by, dry_run=True):
 
     try:
         report_insert = supabase.table("bank_reports").insert({
-            "filename": os.path.basename(file_path),
+            "filename": original_filename or os.path.basename(file_path),
             "uploaded_by": uploaded_by,
         }).execute()
         report_id = report_insert.data[0]["id"]
