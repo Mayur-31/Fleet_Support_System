@@ -5,6 +5,8 @@ Supports two input formats:
 
 1. Raw bank portal report — "Transaction Initiation Detail Report".
    Single sheet. Metadata block, header row, payment rows, totals block.
+   A single file can contain multiple transaction blocks ("1 of 4" etc.),
+   each with its own repeated header row.
 
 2. Legacy 4-sheet report from the old back office:
    - Driver Type Summary
@@ -293,7 +295,7 @@ def _parse_legacy_format(file_path: Path) -> dict:
 def _parse_raw_format(file_path: Path, excel_file: pd.ExcelFile) -> dict:
     raw = pd.read_excel(excel_file, sheet_name=excel_file.sheet_names[0], header=None)
 
-    # 1. Locate the header row
+    # 1. Locate the FIRST header row
     header_row_idx = None
     for i in range(len(raw)):
         row = raw.iloc[i]
@@ -310,7 +312,7 @@ def _parse_raw_format(file_path: Path, excel_file: pd.ExcelFile) -> dict:
             f"This may not be a complete Transaction Initiation Detail Report."
         )
 
-    # 2. Build column-name → index map
+    # 2. Build column-name → index map from the first header
     header_row = raw.iloc[header_row_idx]
     col_map = {}
     for idx, cell in enumerate(header_row):
@@ -335,7 +337,7 @@ def _parse_raw_format(file_path: Path, excel_file: pd.ExcelFile) -> dict:
             f"Bank file header row is missing required column(s): {missing}."
         )
 
-    # 3. Read metadata above the header
+    # 3. Read metadata above the FIRST header (Value Date, Transaction Ref)
     value_date = None
     transaction_ref = None
     for i in range(header_row_idx):
@@ -357,11 +359,24 @@ def _parse_raw_format(file_path: Path, excel_file: pd.ExcelFile) -> dict:
                         transaction_ref = candidate
                         break
 
-    # 4. Read data rows
+    # 4. Read data rows.
+    #    A single file may contain multiple transaction blocks ("1 of 4" etc.),
+    #    each with its own repeated header row. We must skip those headers,
+    #    otherwise they are parsed as fake data rows and (because they all
+    #    share the literal text "Payment Reference" in the reference column)
+    #    they hash to the same bank_line_id, triggering a false duplicate.
     payment_lines = []
     for i in range(header_row_idx + 1, len(raw)):
         row_values = raw.iloc[i].tolist()
 
+        # Skip repeated header rows from additional transaction blocks.
+        header_probe = _strip_html(
+            _to_str(_get_cell(row_values, col_map["beneficiary_account"]))
+        )
+        if header_probe and RAW_HEADER_MARKER in header_probe:
+            continue
+
+        # Stop at any footer marker row
         first_text = None
         for cell in row_values:
             text = _strip_html(_to_str(cell))
