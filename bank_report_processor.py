@@ -74,20 +74,24 @@ def normalize_amount(value):
 
 
 def get_week_from_lines(parsed):
-    """Only matched lines determine the week -- unmatched lines (when present)
-    have no WeekNumber column in the raw bank file."""
-    weeks_seen = set()
+    """
+    Return (majority_week, sorted_list_of_all_weeks).
+
+    A bank file can legitimately contain lines from more than one week
+    (e.g. a late week-37 payment alongside week-38 payments). We don't
+    reject such files -- we return the majority week (for the report
+    header) and the full list of weeks present, so the caller can match
+    each line against its OWN week's payment runs.
+    """
+    weeks_seen = Counter()
     for line in parsed.get('matched_paid_lines', []):
         week = line.get('WeekNumber')
         if week is not None:
-            weeks_seen.add(int(week))
+            weeks_seen[int(week)] += 1
     if not weeks_seen:
         raise ValueError("No WeekNumber found in Matched Paid lines.")
-    if len(weeks_seen) > 1:
-        raise ValueError(
-            f"File contains multiple week numbers: {sorted(weeks_seen)} -- expected one."
-        )
-    return weeks_seen.pop()
+    majority = weeks_seen.most_common(1)[0][0]
+    return majority, sorted(weeks_seen.keys())
 
 
 def get_response_data(response):
@@ -120,7 +124,12 @@ def _narrow_by_date(candidate_expenses, bank_date_iso, payment_runs):
     except (ValueError, TypeError):
         return candidate_expenses
 
-    one_after, exact = [], []
+    # Weekend payments land on Monday, so deltas of +1, +2 and +3 are all
+    # legitimate (Sat, Sun, Fri expenses paid the following Monday).
+    # Prefer the smallest non-zero delta (Sat's expense paid Monday has
+    # delta 2, Sun's has delta 1, Fri's has delta 3) -- we prefer +1
+    # because Sunday's expense is the "normal" case for a Monday payment.
+    delta_1, delta_2, delta_3, exact = [], [], [], []
     for exp in candidate_expenses:
         run_date_str = payment_runs.get(exp["payment_run_id"])
         if not run_date_str:
@@ -131,11 +140,15 @@ def _narrow_by_date(candidate_expenses, bank_date_iso, payment_runs):
             continue
         delta = (bank_date - run_date).days
         if delta == 1:
-            one_after.append(exp)
+            delta_1.append(exp)
+        elif delta == 2:
+            delta_2.append(exp)
+        elif delta == 3:
+            delta_3.append(exp)
         elif delta == 0:
             exact.append(exp)
 
-    for bucket in (one_after, exact):
+    for bucket in (delta_1, delta_2, delta_3, exact):
         if len(bucket) == 1:
             return bucket
         if len(bucket) > 1:
@@ -190,30 +203,38 @@ def process_bank_report(file_path, uploaded_by, dry_run=True, original_filename=
     result["total_lines"] = len(matched_lines) + len(unmatched_lines)
 
     try:
-        week_number = get_week_from_lines(parsed)
+        week_number, all_weeks = get_week_from_lines(parsed)
         result["week_number"] = week_number
     except Exception as e:
         result["errors"].append(f"Week detection error: {e}")
         return result
 
-    # ---- Fetch every payment run for this week (there may be several) ----
+    
+    # ---- Fetch payment runs for EVERY week present in the file ----
     try:
-        pr_resp = (
-            supabase.table("payment_runs")
-            .select("id, expense_file_date")
-            .eq("week_number", week_number)
-            .execute()
-        )
-        pr_rows = get_response_data(pr_resp)
-        if not pr_rows:
-            result["errors"].append(f"No payment run found for week {week_number}.")
-            return result
-        payment_runs = {row["id"]: row.get("expense_file_date") for row in pr_rows}
-        payment_run_ids = list(payment_runs.keys())
-        result["payment_run_id"] = payment_run_ids[0]
+        payment_runs_by_week = {}
+        for w in all_weeks:
+            pr_resp = (
+                supabase.table("payment_runs")
+                .select("id, expense_file_date")
+                .eq("week_number", w)
+                .execute()
+            )
+            pr_rows = get_response_data(pr_resp)
+            payment_runs_by_week[w] = {
+                row["id"]: row.get("expense_file_date") for row in pr_rows
+            }
     except Exception as e:
         result["errors"].append(f"Payment run lookup error: {e}")
         return result
+
+    # Flat run_id -> expense_file_date lookup, used by date disambiguation.
+    payment_runs = {}
+    for week_runs in payment_runs_by_week.values():
+        payment_runs.update(week_runs)
+
+    # Legacy result field, kept for downstream callers.
+    result["payment_run_id"] = next(iter(payment_runs), None)
 
     existing_ids = _get_existing_bank_line_ids() if not dry_run else set()
     rows_to_write = []
@@ -251,15 +272,25 @@ def process_bank_report(file_path, uploaded_by, dry_run=True, original_filename=
             else:
                 driver_id = drv_rows[0]["id"]
 
-                # Every expense for this driver across every run in this week.
-                exp_resp = (
-                    supabase.table("job_expenses")
-                    .select("id, amount, status, payment_run_id")
-                    .eq("driver_id", driver_id)
-                    .in_("payment_run_id", payment_run_ids)
-                    .execute()
-                )
-                expenses = get_response_data(exp_resp)
+                # Match against the payment runs for THIS line's week only.
+                line_week = line.get("WeekNumber")
+                if line_week is not None:
+                    week_runs = payment_runs_by_week.get(int(line_week), {})
+                    candidate_run_ids = list(week_runs.keys())
+                else:
+                    candidate_run_ids = list(payment_runs.keys())
+
+                if not candidate_run_ids:
+                    expenses = []
+                else:
+                    exp_resp = (
+                        supabase.table("job_expenses")
+                        .select("id, amount, status, payment_run_id")
+                        .eq("driver_id", driver_id)
+                        .in_("payment_run_id", candidate_run_ids)
+                        .execute()
+                    )
+                    expenses = get_response_data(exp_resp)
 
                 if len(expenses) == 0:
                     status, reason = "unmatched", "No expense found for driver in this week"
@@ -307,7 +338,7 @@ def process_bank_report(file_path, uploaded_by, dry_run=True, original_filename=
                             except (ValueError, TypeError):
                                 pass
 
-                        if delta_days in (0, 1):
+                        if delta_days in (0, 1, 2, 3):
                             matched_expense_id = expense["id"]
                             status = "matched"
                             delta_str = _format_delta(line.get("BankExecutionDate"), exp_date)
@@ -375,7 +406,7 @@ def process_bank_report(file_path, uploaded_by, dry_run=True, original_filename=
             "driver_type": line.get("DriverType"),
             "driver_reference": driver_ref,
             "driver_name": line.get("DriverName"),
-            "week_number": week_number,
+            "week_number": line.get("WeekNumber"),
             "bank_sort": line.get("BankSort"),
             "bank_account": line.get("BankAccount"),
             "match_status": status,
