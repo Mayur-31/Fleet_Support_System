@@ -33,6 +33,7 @@ def parse_expense_date(filename: str) -> Optional[str]:
     except ValueError:
         return None
 
+
 def load_and_aggregate(filepath: str) -> pd.DataFrame:
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".csv":
@@ -48,6 +49,19 @@ def load_and_aggregate(filepath: str) -> pd.DataFrame:
             f"Expenses file is missing expected column(s): {missing_cols}. "
             f"Found columns: {list(df.columns)}"
         )
+ 
+    # Drop repeated header rows. Some expenses files contain the header
+    # ("REGISTRATION | Driver | code | AV") more than once, e.g. as visual
+    # separators between blocks of drivers. After pandas consumes the first
+    # header, subsequent headers appear as data rows where the code column
+    # contains the literal text "code". Dropping them here prevents the
+    # forward-fill below from propagating "code" as if it were a real code.
+    df = df[df["code"].astype(str).str.strip().str.lower() != "code"]
+ 
+    # Coerce AV to numeric. Any stray text values (e.g. from a header row
+    # that slipped through, or an unexpected cell type) become NaN and are
+    # ignored by the sum, rather than raising on groupby.agg.
+    df["AV"] = pd.to_numeric(df["AV"], errors="coerce")
  
     # The code column is only filled on the first row of each job block;
     # forward-fill so the second (expense add-on) row is attributed correctly.
