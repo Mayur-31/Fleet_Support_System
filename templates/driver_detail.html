@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}{{ driver.name }} — Fleet Support Payments{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1 class="m-0">{{ driver.name }}</h1>
+    <a href="{{ url_for('driver_edit', driver_id=driver.id) }}" class="btn btn-primary">Edit Driver</a>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">Driver Details</div>
+            <div class="card-body">
+                <dl class="row mb-0">
+                    <dt class="col-sm-4">Name</dt><dd class="col-sm-8">{{ driver.name }}</dd>
+                    <dt class="col-sm-4">Driver Code</dt><dd class="col-sm-8">{{ driver.driver_code }}</dd>
+                    <dt class="col-sm-4">Added</dt><dd class="col-sm-8">{{ driver.created_at|datetime }}</dd>
+                </dl>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">Bank Details</div>
+            <div class="card-body">
+                {% if bank %}
+                <dl class="row mb-0">
+                    <dt class="col-sm-4">Account Number</dt><dd class="col-sm-8">{{ bank.account_number or '—' }}</dd>
+                    <dt class="col-sm-4">Sort Code</dt><dd class="col-sm-8">{{ bank.sort_code or '—' }}</dd>
+                    <dt class="col-sm-4">Last Updated</dt>
+                    <dd class="col-sm-8">{% if bank.updated_at %}{{ bank.updated_at|datetime }}{% else %}—{% endif %}</dd>
+                </dl>
+                {% else %}
+                <p class="text-danger mb-0">No bank details on file. Driver cannot be paid until these are added.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-md-6">
+        <div class="alert alert-success mb-0"><strong>Total paid:</strong> £{{ "%.2f"|format(total_paid) }}</div>
+    </div>
+    <div class="col-md-6">
+        <div class="alert alert-warning mb-0"><strong>Total unpaid:</strong> £{{ "%.2f"|format(total_unpaid) }}</div>
+    </div>
+</div>
+
+<h3>Payment History</h3>
+{% if not expenses %}
+<p class="text-muted">No expenses recorded for this driver yet.</p>
+{% else %}
+<table class="table table-striped table-bordered">
+    <thead class="table-dark">
+        <tr>
+            <th>Week</th>
+            <th>Expense Date</th>
+            <th class="text-end">Amount (£)</th>
+            <th>Status</th>
+            <th>Paid On</th>
+            <th>Bank Report</th>
+            <th>Match</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for e in expenses %}
+        <tr>
+            <td>{{ e.run.week_number or '—' }}</td>
+            <td>{{ e.run.expense_file_date|date_only }}</td>
+            <td class="text-end">{{ "%.2f"|format(e.amount or 0) }}</td>
+            <td>
+                {% if e.status == 'paid' %}<span class="badge bg-success">Paid</span>
+                {% else %}<span class="badge bg-secondary">{{ e.status|capitalize }}</span>{% endif %}
+            </td>
+            <td>{% if e.match and e.match.bank_execution_date %}{{ e.match.bank_execution_date|date_only }}{% else %}—{% endif %}</td>
+            <td>{{ e.match.report_filename if e.match and e.match.report_filename else '—' }}</td>
+            <td>
+                {% if e.match %}
+                <span class="badge bg-{{
+                    'success' if e.match.match_status == 'matched'
+                    else 'danger' if e.match.match_status == 'unmatched'
+                    else 'warning' if e.match.match_status in ('ambiguous', 'amount_mismatch')
+                    else 'secondary'
+                }}">{{ e.match.match_status }}</span>
+                {% else %}<span class="text-muted">—</span>{% endif %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+<a href="{{ url_for('drivers_list') }}" class="btn btn-outline-secondary mt-3">Back to Drivers</a>
+{% endblock %}

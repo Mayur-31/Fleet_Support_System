@@ -13,6 +13,7 @@ added alongside the existing Change Password / Manage Users features
 import csv as csv_module
 import os
 import uuid
+import re as _re
 
 from flask import Flask, render_template, request, flash, redirect, url_for, send_from_directory, session
 from flask_wtf import CSRFProtect
@@ -186,6 +187,61 @@ def format_date_only(value):
     if isinstance(value, str) and len(value) >= 10:
         return f"{value[8:10]}/{value[5:7]}/{value[0:4]}"
     return value
+
+def _mask(value, keep=4):
+    """Show only the last N characters of a sensitive value."""
+    if not value:
+        return "—"
+    s = str(value)
+    if len(s) <= keep:
+        return s
+    return "*" * (len(s) - keep) + s[-keep:]
+
+
+def _log_driver_change(action, driver_id, details, user_id):
+    """Audit log for driver/bank changes with sensitive values masked."""
+    def _scrub(d):
+        out = {}
+        for k, v in (d or {}).items():
+            if isinstance(v, dict):
+                out[k] = _scrub(v)
+            elif k in ("account_number", "sort_code"):
+                out[k] = _mask(v)
+            else:
+                out[k] = v
+        return out
+
+    app.logger.info(
+        f"AUDIT: action={action} driver_id={driver_id} "
+        f"user={user_id} details={_scrub(details)}"
+    )
+
+
+def _validate_bank_fields(account_number, sort_code):
+    """
+    Returns (normalised_account, normalised_sort_display, error_or_None).
+    UK format: account = 8 digits, sort code = 6 digits.
+    """
+    raw_acc = (account_number or "").strip()
+    raw_sort = (sort_code or "").strip()
+
+    if raw_acc and not _re.fullmatch(r"[\d\-\s]*", raw_acc):
+        return None, None, "Account number contains invalid characters."
+    if raw_sort and not _re.fullmatch(r"[\d\-\s]*", raw_sort):
+        return None, None, "Sort code contains invalid characters."
+
+    acc = _re.sub(r"[\-\s]", "", raw_acc)
+    sort = _re.sub(r"[\-\s]", "", raw_sort)
+
+    if acc and len(acc) != 8:
+        return None, None, "Account number must be exactly 8 digits."
+    if sort and len(sort) != 6:
+        return None, None, "Sort code must be exactly 6 digits (e.g. 161424)."
+    if bool(acc) != bool(sort):
+        return None, None, "Please provide both account number and sort code, or neither."
+
+    sort_display = f"{sort[:2]}-{sort[2:4]}-{sort[4:]}" if sort else ""
+    return acc or None, sort_display or None, None
 
 @app.get("/up")
 def health_check():
@@ -904,6 +960,327 @@ def delete_bank_report(report_id):
     flash(f'Bank report "{report_resp.data[0]["filename"]}" (Week {report_resp.data[0]["week_number"]}) deleted successfully.', 'success')
     return redirect(url_for('bank_report_list'))
 
+
+@app.route("/drivers")
+@auth.login_required
+@auth.active_user_required
+def drivers_list():
+    search = request.args.get("q", "").strip()
+
+    drivers_resp = (
+        supabase.table("drivers")
+        .select("id, name, driver_code, created_at")
+        .order("name")
+        .execute()
+    )
+    drivers = drivers_resp.data or []
+
+    driver_ids = [d["id"] for d in drivers]
+    bank_map = {}
+    if driver_ids:
+        bd_resp = (
+            supabase.table("driver_bank_details")
+            .select("driver_id, sort_code, account_number")
+            .in_("driver_id", driver_ids)
+            .execute()
+        )
+        for row in bd_resp.data or []:
+            bank_map[row["driver_id"]] = row
+
+    if search:
+        s = search.lower()
+        filtered = []
+        for d in drivers:
+            bank = bank_map.get(d["id"], {})
+            haystack = " ".join([
+                d.get("name") or "",
+                d.get("driver_code") or "",
+                bank.get("account_number") or "",
+                bank.get("sort_code") or "",
+            ]).lower()
+            if s in haystack:
+                filtered.append(d)
+        drivers = filtered
+
+    for d in drivers:
+        d["bank"] = bank_map.get(d["id"])
+
+    return render_template("drivers_list.html", drivers=drivers, search=search)
+
+
+@app.route("/drivers/new", methods=["GET", "POST"])
+@auth.login_required
+@auth.active_user_required
+def driver_new():
+    if request.method == "GET":
+        return render_template("driver_form.html", driver=None, bank=None, mode="new")
+
+    name = request.form.get("name", "").strip()
+    driver_code = request.form.get("driver_code", "").strip().upper()
+    account_number = request.form.get("account_number", "").strip()
+    sort_code = request.form.get("sort_code", "").strip()
+
+    if not name or not driver_code:
+        flash("Name and driver code are required.", "danger")
+        return redirect(url_for("driver_new"))
+
+    acc, sort, err = _validate_bank_fields(account_number, sort_code)
+    if err:
+        flash(err, "danger")
+        return redirect(url_for("driver_new"))
+
+    existing = supabase.table("drivers").select("id").eq("driver_code", driver_code).execute()
+    if existing.data:
+        flash(f"A driver with code {driver_code} already exists.", "danger")
+        return redirect(url_for("driver_new"))
+
+    new_id = None
+    try:
+        insert = supabase.table("drivers").insert({
+            "name": name,
+            "driver_code": driver_code,
+        }).execute()
+        new_id = insert.data[0]["id"]
+
+        if acc and sort:
+            supabase.table("driver_bank_details").insert({
+                "driver_id": new_id,
+                "account_number": acc,
+                "sort_code": sort,
+            }).execute()
+
+        _log_driver_change(
+            "create_driver", new_id,
+            {"name": name, "driver_code": driver_code,
+             "account_number": acc, "sort_code": sort},
+            session.get("user_id"),
+        )
+        flash(f"Driver {name} ({driver_code}) created.", "success")
+        return redirect(url_for("driver_detail", driver_id=new_id))
+
+    except Exception:
+        app.logger.exception("Failed to create driver")
+        if new_id:
+            try:
+                supabase.table("driver_bank_details").delete().eq("driver_id", new_id).execute()
+                supabase.table("drivers").delete().eq("id", new_id).execute()
+            except Exception:
+                app.logger.exception("Rollback of partial driver creation failed")
+        flash("Could not create the driver. Please try again.", "danger")
+        return redirect(url_for("driver_new"))
+
+
+@app.route("/drivers/<uuid:driver_id>")
+@auth.login_required
+@auth.active_user_required
+def driver_detail(driver_id):
+    driver_id_str = str(driver_id)
+
+    d_resp = supabase.table("drivers").select("*").eq("id", driver_id_str).execute()
+    if not d_resp.data:
+        flash("Driver not found.", "danger")
+        return redirect(url_for("drivers_list"))
+    driver = d_resp.data[0]
+
+    b_resp = (
+        supabase.table("driver_bank_details")
+        .select("*")
+        .eq("driver_id", driver_id_str)
+        .execute()
+    )
+    bank = b_resp.data[0] if b_resp.data else None
+
+    exp_resp = (
+        supabase.table("job_expenses")
+        .select("id, amount, status, payment_run_id")
+        .eq("driver_id", driver_id_str)
+        .execute()
+    )
+    expenses = exp_resp.data or []
+
+    run_ids = list({e["payment_run_id"] for e in expenses if e.get("payment_run_id")})
+    run_map = {}
+    if run_ids:
+        r_resp = (
+            supabase.table("payment_runs")
+            .select("id, week_number, expense_file_date, status")
+            .in_("id", run_ids)
+            .execute()
+        )
+        for r in r_resp.data or []:
+            run_map[r["id"]] = r
+
+    expense_ids = [e["id"] for e in expenses]
+    match_map = {}
+    report_map = {}
+    if expense_ids:
+        m_resp = (
+            supabase.table("bank_report_lines")
+            .select("matched_job_expense_id, bank_execution_date, match_status, reason, bank_report_id")
+            .in_("matched_job_expense_id", expense_ids)
+            .execute()
+        )
+        matches = m_resp.data or []
+        for m in matches:
+            eid = m.get("matched_job_expense_id")
+            if eid and eid not in match_map:
+                match_map[eid] = m
+
+        report_ids = list({m["bank_report_id"] for m in matches if m.get("bank_report_id")})
+        if report_ids:
+            r2 = (
+                supabase.table("bank_reports")
+                .select("id, filename")
+                .in_("id", report_ids)
+                .execute()
+            )
+            for r in r2.data or []:
+                report_map[r["id"]] = r["filename"]
+
+    for e in expenses:
+        e["run"] = run_map.get(e["payment_run_id"], {})
+        e["match"] = match_map.get(e["id"])
+        if e["match"]:
+            e["match"]["report_filename"] = report_map.get(e["match"].get("bank_report_id"))
+
+    expenses.sort(
+        key=lambda x: (x["run"].get("expense_file_date") or "", x["id"]),
+        reverse=True,
+    )
+
+    total_paid = sum(float(e["amount"] or 0) for e in expenses if e.get("status") == "paid")
+    total_unpaid = sum(float(e["amount"] or 0) for e in expenses if e.get("status") != "paid")
+
+    return render_template(
+        "driver_detail.html",
+        driver=driver, bank=bank, expenses=expenses,
+        total_paid=total_paid, total_unpaid=total_unpaid,
+    )
+
+
+@app.route("/drivers/<uuid:driver_id>/edit", methods=["GET", "POST"])
+@auth.login_required
+@auth.active_user_required
+def driver_edit(driver_id):
+    driver_id_str = str(driver_id)
+
+    d_resp = supabase.table("drivers").select("*").eq("id", driver_id_str).execute()
+    if not d_resp.data:
+        flash("Driver not found.", "danger")
+        return redirect(url_for("drivers_list"))
+    driver = d_resp.data[0]
+
+    b_resp = (
+        supabase.table("driver_bank_details")
+        .select("*")
+        .eq("driver_id", driver_id_str)
+        .execute()
+    )
+    bank = b_resp.data[0] if b_resp.data else None
+
+    if request.method == "GET":
+        return render_template("driver_form.html", driver=driver, bank=bank, mode="edit")
+
+    name = request.form.get("name", "").strip()
+    driver_code = request.form.get("driver_code", "").strip().upper()
+    account_number = request.form.get("account_number", "").strip()
+    sort_code = request.form.get("sort_code", "").strip()
+    confirm_bank_change = request.form.get("confirm_bank_change") == "yes"
+
+    if not name or not driver_code:
+        flash("Name and driver code are required.", "danger")
+        return redirect(url_for("driver_edit", driver_id=driver_id_str))
+
+    acc, sort, err = _validate_bank_fields(account_number, sort_code)
+    if err:
+        flash(err, "danger")
+        return redirect(url_for("driver_edit", driver_id=driver_id_str))
+
+    existing = supabase.table("drivers").select("id").eq("driver_code", driver_code).execute()
+    clash = [r for r in (existing.data or []) if r["id"] != driver_id_str]
+    if clash:
+        flash(f"Another driver already uses code {driver_code}.", "danger")
+        return redirect(url_for("driver_edit", driver_id=driver_id_str))
+
+    old_acc = (bank or {}).get("account_number")
+    old_sort = (bank or {}).get("sort_code")
+    bank_changed = (acc != old_acc) or (sort != old_sort)
+
+    if bank_changed and not confirm_bank_change:
+        flash(
+            "You are changing the payment bank details for this driver. "
+            "Please tick the confirmation box to proceed.",
+            "warning",
+        )
+        return redirect(url_for("driver_edit", driver_id=driver_id_str))
+
+    before = {
+        "name": driver.get("name"),
+        "driver_code": driver.get("driver_code"),
+        "account_number": old_acc,
+        "sort_code": old_sort,
+    }
+
+    try:
+        supabase.table("drivers").update({
+            "name": name, "driver_code": driver_code,
+        }).eq("id", driver_id_str).execute()
+
+        if bank:
+            if acc and sort:
+                supabase.table("driver_bank_details").update({
+                    "account_number": acc, "sort_code": sort,
+                }).eq("driver_id", driver_id_str).execute()
+            # If both fields are blank but a bank record exists, leave it
+            # untouched. Removing bank details must be a deliberate action,
+            # not an accidental consequence of submitting an empty form.
+        else:
+            if acc and sort:
+                supabase.table("driver_bank_details").insert({
+                    "driver_id": driver_id_str,
+                    "account_number": acc, "sort_code": sort,
+                }).execute()
+
+        _log_driver_change(
+            "update_driver", driver_id_str,
+            {"before": before,
+             "after": {"name": name, "driver_code": driver_code,
+                       "account_number": acc, "sort_code": sort}},
+            session.get("user_id"),
+        )
+
+        flash(f"Driver {name} updated.", "success")
+        return redirect(url_for("driver_detail", driver_id=driver_id_str))
+
+    except Exception:
+        app.logger.exception("Failed to update driver — rolling back")
+        try:
+            supabase.table("drivers").update({
+                "name": before["name"], "driver_code": before["driver_code"],
+            }).eq("id", driver_id_str).execute()
+
+            current = supabase.table("driver_bank_details").select("driver_id").eq("driver_id", driver_id_str).execute()
+            if current.data:
+                if before["account_number"] and before["sort_code"]:
+                    supabase.table("driver_bank_details").update({
+                        "account_number": before["account_number"],
+                        "sort_code": before["sort_code"],
+                    }).eq("driver_id", driver_id_str).execute()
+                else:
+                    supabase.table("driver_bank_details").delete().eq("driver_id", driver_id_str).execute()
+            else:
+                if before["account_number"] and before["sort_code"]:
+                    supabase.table("driver_bank_details").insert({
+                        "driver_id": driver_id_str,
+                        "account_number": before["account_number"],
+                        "sort_code": before["sort_code"],
+                    }).execute()
+        except Exception:
+            app.logger.exception("Rollback of driver edit failed")
+
+        flash("Could not update the driver. Please try again.", "danger")
+        return redirect(url_for("driver_edit", driver_id=driver_id_str))
+    
 
 if __name__ == "__main__":
     app.run(debug=True)

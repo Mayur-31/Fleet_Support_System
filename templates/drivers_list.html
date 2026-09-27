@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Drivers — Fleet Support Payments{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1 class="m-0">Drivers</h1>
+    <a href="{{ url_for('driver_new') }}" class="btn btn-primary">Add New Driver</a>
+</div>
+
+<form method="get" class="mb-3" style="max-width:600px;">
+    <div class="input-group">
+        <input type="text" name="q" class="form-control"
+               placeholder="Search by name, code, or account number…"
+               value="{{ search }}">
+        <button class="btn btn-outline-secondary" type="submit">Search</button>
+        {% if search %}
+        <a href="{{ url_for('drivers_list') }}" class="btn btn-outline-secondary">Clear</a>
+        {% endif %}
+    </div>
+</form>
+
+{% if not drivers %}
+<p class="text-muted">
+    {% if search %}No drivers match "{{ search }}".{% else %}No drivers yet.{% endif %}
+</p>
+{% else %}
+<table class="table table-striped table-bordered">
+    <thead class="table-dark">
+        <tr>
+            <th>Driver Code</th>
+            <th>Name</th>
+            <th>Account Number</th>
+            <th>Sort Code</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for d in drivers %}
+        <tr>
+            <td>{{ d.driver_code }}</td>
+            <td>{{ d.name }}</td>
+            <td>
+                {% if d.bank and d.bank.account_number %}
+                    ****{{ d.bank.account_number[-4:] }}
+                {% else %}<span class="text-danger">Missing</span>{% endif %}
+            </td>
+            <td>
+                {% if d.bank and d.bank.sort_code %}
+                    **-**-{{ d.bank.sort_code[-2:] if d.bank.sort_code|length > 2 else d.bank.sort_code }}
+                {% else %}<span class="text-danger">Missing</span>{% endif %}
+            </td>
+            <td>
+                <a href="{{ url_for('driver_detail', driver_id=d.id) }}" class="btn btn-sm btn-info">View</a>
+                <a href="{{ url_for('driver_edit', driver_id=d.id) }}" class="btn btn-sm btn-outline-secondary">Edit</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+<a href="{{ url_for('home') }}" class="btn btn-outline-secondary mt-3">Back to Home</a>
+{% endblock %}

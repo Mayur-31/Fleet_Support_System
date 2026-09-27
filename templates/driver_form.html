@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit' if mode == 'edit' else 'Add' }} Driver — Fleet Support Payments{% endblock %}
+{% block content %}
+<h1 class="mb-4">{{ 'Edit Driver' if mode == 'edit' else 'Add New Driver' }}</h1>
+
+<form method="post" class="card p-4" style="max-width:600px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <div class="mb-3">
+        <label for="name" class="form-label">Full Name</label>
+        <input type="text" class="form-control" id="name" name="name"
+               value="{{ driver.name if driver else '' }}" required autofocus>
+    </div>
+
+    <div class="mb-3">
+        <label for="driver_code" class="form-label">Driver Code</label>
+        <input type="text" class="form-control" id="driver_code" name="driver_code"
+               value="{{ driver.driver_code if driver else '' }}" required>
+        <div class="form-text">Must be unique. Example: TP1186</div>
+    </div>
+
+    <hr>
+    <h5 class="mb-3">Bank Details</h5>
+
+    <div class="mb-3">
+        <label for="account_number" class="form-label">Account Number</label>
+        <input type="text" class="form-control" id="account_number" name="account_number"
+               value="{{ bank.account_number if bank else '' }}">
+        <div class="form-text">8 digits.</div>
+    </div>
+
+    <div class="mb-3">
+        <label for="sort_code" class="form-label">Sort Code</label>
+        <input type="text" class="form-control" id="sort_code" name="sort_code"
+               value="{{ bank.sort_code if bank else '' }}">
+        <div class="form-text">6 digits. Example: 161424 or 16-14-24.</div>
+    </div>
+
+    {% if mode == 'edit' %}
+    <div class="alert alert-warning">
+        <strong>Changing bank details?</strong>
+        If you are changing the account number or sort code, tick the box below to confirm
+        you have verified the new details with the driver. This changes where future payments go.
+    </div>
+    <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" value="yes"
+               id="confirm_bank_change" name="confirm_bank_change">
+        <label class="form-check-label" for="confirm_bank_change">
+            I confirm these bank details are correct
+        </label>
+    </div>
+    {% endif %}
+
+    <div class="d-flex gap-2">
+        <button type="submit" class="btn btn-primary">
+            {{ 'Save Changes' if mode == 'edit' else 'Create Driver' }}
+        </button>
+        {% if mode == 'edit' %}
+        <a href="{{ url_for('driver_detail', driver_id=driver.id) }}" class="btn btn-outline-secondary">Cancel</a>
+        {% else %}
+        <a href="{{ url_for('drivers_list') }}" class="btn btn-outline-secondary">Cancel</a>
+        {% endif %}
+    </div>
+</form>
+{% endblock %}
