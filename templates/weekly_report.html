@@ -18,7 +18,7 @@
         <select class="form-select" id="week_number" name="week_number" required>
             <option value="">Choose a week…</option>
             {% for w in weeks %}
-            <option value="{{ w }}">Week {{ w }}</option>
+            <option value="{{ w.number }}">{{ w.display }}</option>
             {% endfor %}
         </select>
     </div>
