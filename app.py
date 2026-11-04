@@ -593,7 +593,6 @@ def weekly_report():
             .data
         )
         
-        # Group by week to find the start and end date
         week_ranges = {}
         for r in runs:
             week = r["week_number"]
@@ -609,13 +608,11 @@ def weekly_report():
                 if date > week_ranges[week]["max"]:
                     week_ranges[week]["max"] = date
 
-        # Format the weeks list to pass to the template
         weeks_data = []
         for week in sorted(week_ranges.keys(), reverse=True):
             min_date = week_ranges[week]["min"]
             max_date = week_ranges[week]["max"]
             
-            # Format dates for display (e.g., 11/10/2026)
             def fmt_date(d_str):
                 try:
                     return datetime.strptime(str(d_str), "%Y-%m-%d").strftime("%d/%m/%Y")
@@ -631,6 +628,26 @@ def weekly_report():
             weeks_data.append({"number": week, "display": display_text})
             
         return render_template("weekly_report.html", weeks=weeks_data, result=None)
+
+    # ---------------------------------------------------------
+    # POST Logic (This was missing!)
+    # ---------------------------------------------------------
+    week_str = request.form.get("week_number", "").strip()
+    if not week_str.isdigit():
+        flash("Please choose a week.", "danger")
+        return redirect(url_for("weekly_report"))
+
+    try:
+        result = generate_weekly_report.generate_weekly_report(int(week_str))
+    except ValueError as e:
+        flash(str(e), "danger")
+        return redirect(url_for("weekly_report"))
+    except Exception:
+        app.logger.exception("Weekly report generation failed")
+        flash("Something went wrong generating the report.", "danger")
+        return redirect(url_for("weekly_report"))
+
+    return render_template("weekly_report.html", weeks=None, result=result)
 
 
 @app.route("/weekly-report/download/<path:filename>")
